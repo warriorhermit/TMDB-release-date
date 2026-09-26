@@ -1,7 +1,7 @@
 {
-  "name": "nuvio-tmdb-release-addon",
-  "version": "1.1.0",
-  "description": "Nuvio/Stremio metadata addon for TMDB theatrical and digital release dates",
+  "name": "release-dates-stream-addon",
+  "version": "3.4.0",
+  "description": "Nuvio and Stremio stream addon for TMDB theatrical and digital release dates.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,6 +11,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "stremio-addon-sdk": "^1.6.10"
+    "express": "^5.1.0"
   }
 }
