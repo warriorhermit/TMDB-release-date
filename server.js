@@ -1,228 +1,305 @@
-const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
+const express = require("express");
 
-const PORT = Number(process.env.PORT || 7000);
-const TMDB_TOKEN = process.env.TMDB_API_TOKEN || "";
-const TMDB_API_KEY = process.env.TMDB_API_KEY || "";
-const DEFAULT_REGION = (process.env.DEFAULT_REGION || "IN").toUpperCase();
+const app = express();
+const PORT = process.env.PORT || 7000;
+const SERVER_TMDB_API_TOKEN = process.env.TMDB_API_TOKEN || "";
+const SERVER_TMDB_API_KEY = process.env.TMDB_API_KEY || "";
+const DEFAULT_REGION = (process.env.DEFAULT_REGION || "US").toUpperCase();
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 21600000);
 
-const manifest = {
-  id: "com.nuvio.tmdb.release-dates",
-  version: "1.1.0",
-  name: "TMDB Release Dates",
-  description: "Adds TMDB theatrical and digital release dates to movie metadata.",
-  resources: [
-    {
-      name: "meta",
-      types: ["movie"],
-      idPrefixes: ["tt"]
-    }
-  ],
-  types: ["movie"],
-  idPrefixes: ["tt"],
-  catalogs: [],
-  behaviorHints: {
-    configurable: false
-  }
-};
-
-const builder = new addonBuilder(manifest);
 const cache = new Map();
+const activeRequests = new Map();
 
-function cacheGet(key) {
-  const x = cache.get(key);
-  if (!x) return null;
-  if (Date.now() - x.time > CACHE_TTL_MS) {
-    cache.delete(key);
-    return null;
-  }
-  return x.value;
-}
+// Global CORS Middleware
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
 
-function cacheSet(key, value) {
-  cache.set(key, { time: Date.now(), value });
-  return value;
-}
+function getCredentials(configStr) {
+  let token = SERVER_TMDB_API_TOKEN;
+  let key = SERVER_TMDB_API_KEY;
 
-async function tmdb(path, params = {}) {
-  const url = new URL("https://api.themoviedb.org/3" + path);
-
-  if (TMDB_TOKEN) {
-    // TMDB API Read Access Token authentication.
-  } else if (TMDB_API_KEY) {
-    url.searchParams.set("api_key", TMDB_API_KEY);
-  } else {
-    throw new Error("TMDB credentials are not configured");
-  }
-
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") {
-      url.searchParams.set(k, String(v));
+  if (configStr) {
+    const decoded = decodeURIComponent(configStr).trim();
+    // If the string starts with eyJ (typical JWT Bearer token) or is long, treat as Token
+    if (decoded.startsWith("eyJ") || decoded.length > 50) {
+      token = decoded;
+      key = "";
+    } else if (decoded.length > 0) {
+      key = decoded;
+      token = "";
     }
   }
 
-  const headers = { accept: "application/json" };
-  if (TMDB_TOKEN) headers.Authorization = `Bearer ${TMDB_TOKEN}`;
-
-  const response = await fetch(url, { headers });
-  if (!response.ok) {
-    throw new Error(`TMDB HTTP ${response.status}`);
-  }
-  return response.json();
+  return { token, key };
 }
 
-async function findMovie(imdbId) {
-  const key = "find:" + imdbId;
-  const cached = cacheGet(key);
-  if (cached) return cached;
-
-  const data = await tmdb(`/find/${encodeURIComponent(imdbId)}`, {
-    external_source: "imdb_id"
-  });
-
-  return cacheSet(key, (data.movie_results || [])[0] || null);
+function headers(token) {
+  return token
+    ? { Authorization: `Bearer ${token}`, accept: "application/json" }
+    : { accept: "application/json" };
 }
 
-async function getReleaseDates(tmdbId) {
-  const key = "release:" + tmdbId;
-  const cached = cacheGet(key);
-  if (cached) return cached;
-
-  return cacheSet(key, await tmdb(`/movie/${tmdbId}/release_dates`));
+function tmdbUrl(path, creds) {
+  const u = new URL(`https://api.themoviedb.org/3${path}`);
+  if (!creds.token && creds.key) u.searchParams.set("api_key", creds.key);
+  return u.toString();
 }
 
-function formatDate(value) {
+async function tmdbGet(path, creds) {
+  const r = await fetch(tmdbUrl(path, creds), { headers: headers(creds.token) });
+  const raw = await r.text();
+  let data;
+  try { data = JSON.parse(raw); } catch { data = {}; }
+  if (!r.ok) throw new Error(data.status_message || `TMDB HTTP ${r.status}`);
+  return data;
+}
+
+function parseDate(value) {
   if (!value) return null;
-  const [y, m, d] = value.substring(0, 10).split("-");
-  if (!y || !m || !d) return value;
-
-  return new Intl.DateTimeFormat("en-GB", {
-    day: "2-digit",
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC"
-  }).format(new Date(Date.UTC(+y, +m - 1, +d)));
+  const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!match) return null;
+  const [, y, m, d] = match;
+  const dt = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)));
+  if (Number.isNaN(dt.getTime())) return null;
+  return new Intl.DateTimeFormat("en-US", {
+    day: "2-digit", month: "short", year: "numeric", timeZone: "UTC"
+  }).format(dt);
 }
 
-function firstRelease(country, type) {
-  return (country.release_dates || [])
-    .filter(x => Number(x.type) === type && x.release_date)
-    .sort((a, b) => a.release_date.localeCompare(b.release_date))[0] || null;
+function isoDate(value) {
+  const m = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
 }
 
-function chooseCountry(results) {
-  const order = [
-    DEFAULT_REGION,
-    "US",
-    "GB",
-    ...results.map(x => x.iso_3166_1)
-  ];
-
-  for (const code of [...new Set(order)]) {
-    const country = results.find(x => x.iso_3166_1 === code);
-    if (!country) continue;
-
-    const theatrical = firstRelease(country, 3);
-    const digital = firstRelease(country, 4);
-
-    if (theatrical || digital) {
-      return { code, theatrical, digital };
-    }
+function chooseRelease(countries, type) {
+  const preferred = [...new Set([DEFAULT_REGION, "US", "GB", "IN"])];
+  for (const region of preferred) {
+    const country = countries.find(c => c.iso_3166_1 === region);
+    const release = (country?.release_dates || [])
+      .filter(x => x.type === type && isoDate(x.release_date))
+      .sort((a, b) => isoDate(a.release_date).localeCompare(isoDate(b.release_date)))[0];
+    if (release) return { ...release, region };
   }
 
-  return { code: DEFAULT_REGION, theatrical: null, digital: null };
-}
-
-async function makeMeta(imdbId) {
-  const movie = await findMovie(imdbId);
-  if (!movie) return null;
-
-  const releaseData = await getReleaseDates(movie.id);
-  const selected = chooseCountry(releaseData.results || []);
-
-  const theatrical = selected.theatrical
-    ? formatDate(selected.theatrical.release_date)
-    : null;
-
-  const digital = selected.digital
-    ? formatDate(selected.digital.release_date)
-    : null;
-
-  // Keep this as one releaseInfo string because this is a standard
-  // Stremio metadata field and Nuvio renders it on movie details pages.
-  const releaseInfoParts = [];
-  if (theatrical) releaseInfoParts.push(`Theatrical: ${theatrical}`);
-  if (digital) releaseInfoParts.push(`Digital: ${digital}`);
-
-  const meta = {
-    id: imdbId,
-    type: "movie",
-    name: movie.title || movie.original_title || imdbId,
-
-    // This is the key field consumed by Nuvio/Stremio detail metadata.
-    releaseInfo: releaseInfoParts.length
-      ? releaseInfoParts.join("  •  ")
-      : (movie.release_date || ""),
-
-    // Keep normal movie metadata so preferring this external addon does
-    // not produce a bare title/date-only details page.
-    released: movie.release_date || undefined,
-    year: movie.release_date ? Number(movie.release_date.slice(0, 4)) : undefined,
-    description: movie.overview || undefined,
-    poster: movie.poster_path
-      ? `https://image.tmdb.org/t/p/w600_and_h900_bestv2${movie.poster_path}`
-      : undefined,
-    background: movie.backdrop_path
-      ? `https://image.tmdb.org/t/p/w1280${movie.backdrop_path}`
-      : undefined,
-    genres: Array.isArray(movie.genre_ids)
-      ? undefined
-      : undefined,
-    links: [
-      {
-        name: `TMDB${selected.code ? ` (${selected.code})` : ""}`,
-        category: "movie",
-        url: `https://www.themoviedb.org/movie/${movie.id}`
+  const candidates = [];
+  for (const country of countries) {
+    for (const release of country.release_dates || []) {
+      if (release.type === type && isoDate(release.release_date)) {
+        candidates.push({ ...release, region: country.iso_3166_1 });
       }
-    ],
-    behaviorHints: {
-      defaultVideoId: imdbId
     }
-  };
-
-  return meta;
+  }
+  candidates.sort((a, b) => isoDate(a.release_date).localeCompare(isoDate(b.release_date)));
+  return candidates[0] || null;
 }
 
-builder.defineMetaHandler(async (args) => {
-  if (args.type !== "movie") return { meta: {} };
+async function findMovieByImdb(imdbId, creds) {
+  const find = await tmdbGet(`/find/${encodeURIComponent(imdbId)}?external_source=imdb_id`, creds);
+  let movie = (find.movie_results || [])[0];
+  if (movie?.id) return movie;
+  throw new Error(`TMDB could not map IMDb ID ${imdbId} to a movie`);
+}
 
-  const imdbId = String(args.id || "").split(":")[0];
+async function resolveMovie(rawId, creds) {
+  if (rawId.startsWith("tmdb:")) {
+    const tmdbId = rawId.replace("tmdb:", "");
+    return await tmdbGet(`/movie/${tmdbId}`, creds);
+  }
+  if (/^\d+$/.test(rawId)) {
+    return await tmdbGet(`/movie/${rawId}`, creds);
+  }
+  if (/^tt\d+$/i.test(rawId)) {
+    return await findMovieByImdb(rawId, creds);
+  }
+  throw new Error(`Unsupported ID format: ${rawId}`);
+}
 
-  if (!/^tt\d+$/.test(imdbId)) {
-    return { meta: {} };
+async function getInfo(rawId, creds) {
+  const cacheKey = `${creds.token || creds.key}:${rawId}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) return cached.value;
+  if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
+
+  const promise = (async () => {
+    const movie = await resolveMovie(rawId, creds);
+    const releases = await tmdbGet(`/movie/${movie.id}/release_dates`, creds);
+
+    const countries = releases.results || [];
+    const theatrical = chooseRelease(countries, 3);
+    const digital = chooseRelease(countries, 4);
+
+    const value = {
+      rawId,
+      tmdbId: movie.id,
+      title: movie.title || movie.original_title || rawId,
+      theatrical,
+      digital
+    };
+
+    cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
+    return value;
+  })();
+
+  activeRequests.set(cacheKey, promise);
+  try { return await promise; }
+  finally { activeRequests.delete(cacheKey); }
+}
+
+function stream(info, req) {
+  const theatrical = info.theatrical
+    ? `${parseDate(info.theatrical.release_date)} (${info.theatrical.region})`
+    : "Not announced";
+
+  const digital = info.digital
+    ? `${parseDate(info.digital.release_date)} (${info.digital.region})`
+    : "Not announced";
+
+  const host = req.get("host") || "localhost";
+  const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
+  const dummyVideoUrl = `${protocol}://${host}/dummy.mp4`;
+
+  return [
+    {
+      name: `Release Dates`,
+      title: `🎬 Theatrical: ${theatrical}\n💻 Digital: ${digital}`,
+      description: `🎬 Theatrical: ${theatrical} | 💻 Digital: ${digital}`,
+      url: dummyVideoUrl,
+      externalUrl: `https://www.themoviedb.org/movie/${info.tmdbId}`,
+      behaviorHints: { bingeGroup: "release-dates" }
+    }
+  ];
+}
+
+// Dummy endpoint to satisfy video player stream checking
+app.get("/dummy.mp4", (_req, res) => {
+  res.type("video/mp4").status(204).end();
+});
+
+// HTML Configuration UI
+app.get("/", (_req, res) => {
+  res.type("html").send(`
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>Configure Release Dates Addon</title>
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .card { background: #1e293b; padding: 2.5rem; border-radius: 12px; width: 100%; max-width: 480px; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5); }
+        h1 { margin-top: 0; font-size: 1.5rem; color: #38bdf8; }
+        p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; }
+        label { display: block; margin-top: 1.25rem; font-weight: 500; font-size: 0.9rem; }
+        input[type="text"] { width: 100%; padding: 0.75rem; margin-top: 0.5rem; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; font-size: 0.9rem; }
+        button { width: 100%; padding: 0.75rem; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: 600; margin-top: 1.5rem; cursor: pointer; transition: background 0.2s; }
+        button:hover { background: #0369a1; }
+        .result { margin-top: 1.5rem; display: none; }
+        .manifest-link { word-break: break-all; background: #0f172a; padding: 0.75rem; border-radius: 6px; font-family: monospace; font-size: 0.85rem; border: 1px solid #334155; margin-top: 0.5rem; color: #a5f3fc; }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Release Dates Addon</h1>
+        <p>Enter your TMDB API Read Access Token or API Key below to generate your custom manifest URL for Nuvio and Stremio.</p>
+        <label for="token">TMDB API Token / Key</label>
+        <input type="text" id="token" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
+        <button onclick="generateManifest()">Generate Manifest URL</button>
+        <div class="result" id="resultBlock">
+          <label>Your Manifest URL:</label>
+          <div class="manifest-link" id="manifestUrl"></div>
+        </div>
+      </div>
+      <script>
+        function generateManifest() {
+          const token = document.getElementById("token").value.trim();
+          if (!token) return alert("Please enter a valid TMDB Token or Key");
+          const encoded = encodeURIComponent(token);
+          const url = window.location.origin + "/" + encoded + "/manifest.json";
+          document.getElementById("manifestUrl").innerText = url;
+          document.getElementById("resultBlock").style.display = "block";
+        }
+      </script>
+    </body>
+    </html>
+  `);
+});
+
+app.get("/health", (_req, res) => res.json({
+  status: "ok",
+  version: "3.4.0",
+  defaultRegion: DEFAULT_REGION
+}));
+
+function getManifestJson() {
+  return {
+    id: "com.nuvio.release-dates.stream",
+    version: "3.4.0",
+    name: "Release Dates",
+    description: "Shows theatrical and digital release dates in Nuvio/Stremio.",
+    resources: [
+      "stream",
+      { name: "stream", types: ["movie"], idPrefixes: ["tt", "tmdb:"] }
+    ],
+    types: ["movie"],
+    idPrefixes: ["tt", "tmdb:"],
+    catalogs: []
+  };
+}
+
+app.get("/manifest.json", (_req, res) => res.json(getManifestJson()));
+app.get("/:config/manifest.json", (_req, res) => res.json(getManifestJson()));
+
+async function handleStream(req, res) {
+  if (req.params.type !== "movie") return res.json({ streams: [] });
+
+  let rawId = String(req.params.id);
+  if (rawId.startsWith("tmdb:")) {
+    rawId = "tmdb:" + rawId.slice(5).split(":")[0];
+  } else {
+    rawId = rawId.split(":")[0];
+  }
+
+  const creds = getCredentials(req.params.config);
+  if (!creds.token && !creds.key) {
+    const host = req.get("host") || "localhost";
+    const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
+    return res.json({
+      streams: [{
+        name: "⚠️ Release Dates",
+        title: "TMDB API credentials missing. Please configure the addon.",
+        description: "Missing API token/key.",
+        url: `${protocol}://${host}/dummy.mp4`,
+        externalUrl: `${protocol}://${host}/`
+      }]
+    });
   }
 
   try {
-    const meta = await makeMeta(imdbId);
-    if (!meta) return { meta: {} };
-
-    return {
-      meta,
-      cacheMaxAge: 21600,
-      staleRevalidate: 86400,
-      staleError: 604800
-    };
-  } catch (error) {
-    console.error(`[meta ${imdbId}] ${error.message}`);
-    return { meta: {} };
+    const info = await getInfo(rawId, creds);
+    return res.json({ streams: stream(info, req) });
+  } catch (e) {
+    console.error(`[${rawId}] ${e.message}`);
+    const host = req.get("host") || "localhost";
+    const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
+    return res.json({
+      streams: [{
+        name: "⚠️ Release Dates",
+        title: `Error: ${e.message}`,
+        description: e.message,
+        url: `${protocol}://${host}/dummy.mp4`,
+        externalUrl: "https://www.themoviedb.org/"
+      }]
+    });
   }
-});
+}
 
-serveHTTP(builder.getInterface(), {
-  port: PORT,
-  cacheMaxAge: 21600
-});
+app.get("/stream/:type/:id.json", handleStream);
+app.get("/:config/stream/:type/:id.json", handleStream);
+app.get("/:style/:apiKey/stream/:type/:id.json", handleStream);
 
-console.log(`TMDB Release Dates v1.1.0 listening on port ${PORT}`);
-console.log(`Default region: ${DEFAULT_REGION}`);
-console.log(`Manifest: /manifest.json`);
+app.listen(PORT, () => console.log(`Release Dates addon listening on ${PORT}`));
