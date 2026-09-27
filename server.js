@@ -104,26 +104,41 @@ function chooseRelease(countries, type) {
   return candidates[0] || null;
 }
 
-function findSpecialEdition(countries) {
-  const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
-  const preferred = [...new Set([DEFAULT_REGION, "US", "GB", "IN"])];
+// Scrapes IMDb Technical Specs for alternate cut running times
+async function fetchImdbAltRuntimes(imdbId) {
+  if (!/^tt\d+$/i.test(imdbId)) return null;
 
-  // Look in preferred regions first
-  for (const region of preferred) {
-    const country = countries.find(c => c.iso_3166_1 === region);
-    const release = (country?.release_dates || []).find(
-      x => x.note && editionPattern.test(x.note)
-    );
-    if (release) return release;
-  }
+  try {
+    const res = await fetch(`https://www.imdb.com/title/${imdbId}/technical/`, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+      }
+    });
 
-  // Fallback across all available countries
-  for (const country of countries) {
-    for (const release of country.release_dates || []) {
-      if (release.note && editionPattern.test(release.note)) {
-        return release;
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    const pattern = /(\d+)\s*(?:hr|hours?|h)\s*(?:(\d+)\s*(?:min|minutes?|m))?\s*(?:\((\d+)\s*min\))?\s*\(([^)]+)\)/gi;
+    let match;
+    const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
+
+    while ((match = pattern.exec(html)) !== null) {
+      const hours = parseInt(match[1], 10) || 0;
+      const mins = parseInt(match[2], 10) || 0;
+      const explicitTotalMin = parseInt(match[3], 10);
+      const label = match[4].trim();
+
+      if (editionPattern.test(label)) {
+        const totalMinutes = explicitTotalMin || (hours * 60 + mins);
+        return {
+          editionName: label,
+          runtime: formatMinutes(totalMinutes)
+        };
       }
     }
+  } catch (err) {
+    console.warn(`[IMDb Scrape] Failed for ${imdbId}: ${err.message}`);
   }
 
   return null;
@@ -139,14 +154,17 @@ async function findMovieByImdb(imdbId, creds) {
 async function resolveMovie(rawId, creds) {
   if (rawId.startsWith("tmdb:")) {
     const tmdbId = rawId.replace("tmdb:", "");
-    return await tmdbGet(`/movie/${tmdbId}`, creds);
+    const movie = await tmdbGet(`/movie/${tmdbId}`, creds);
+    return { movie, imdbId: movie.imdb_id || null };
   }
   if (/^\d+$/.test(rawId)) {
-    return await tmdbGet(`/movie/${rawId}`, creds);
+    const movie = await tmdbGet(`/movie/${rawId}`, creds);
+    return { movie, imdbId: movie.imdb_id || null };
   }
   if (/^tt\d+$/i.test(rawId)) {
     const matched = await findMovieByImdb(rawId, creds);
-    return await tmdbGet(`/movie/${matched.id}`, creds);
+    const movie = await tmdbGet(`/movie/${matched.id}`, creds);
+    return { movie, imdbId: rawId };
   }
   throw new Error(`Unsupported ID format: ${rawId}`);
 }
@@ -158,27 +176,32 @@ async function getInfo(rawId, creds) {
   if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
 
   const promise = (async () => {
-    const movie = await resolveMovie(rawId, creds);
+    const { movie, imdbId } = await resolveMovie(rawId, creds);
     const releases = await tmdbGet(`/movie/${movie.id}/release_dates`, creds);
 
     const countries = releases.results || [];
     const theatrical = chooseRelease(countries, 3);
     const digital = chooseRelease(countries, 4);
-    const specialEdition = findSpecialEdition(countries);
 
     const theatricalRuntime = formatMinutes(movie.runtime);
 
-    let specialEditionName = null;
-    let specialRuntime = null;
+    // 1. First, search IMDb for alternate edition running time
+    let specialCut = imdbId ? await fetchImdbAltRuntimes(imdbId) : null;
 
-    if (specialEdition?.note) {
-      // Clean up the edition title removing existing bracketed minutes
-      specialEditionName = specialEdition.note.replace(/\(?\d+\s*(?:min\vert{}mins\vert{}m\b)\)?/i, "").trim();
-
-      // Check if TMDB note explicitly holds runtime (e.g., "180 min", "195 mins")
-      const match = specialEdition.note.match(/(\d+)\s*(?:min|mins|m\b)/i);
-      if (match) {
-        specialRuntime = formatMinutes(parseInt(match[1], 10));
+    // 2. Fallback to TMDB release notes if IMDb didn't list one
+    if (!specialCut) {
+      const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
+      for (const country of countries) {
+        for (const rel of country.release_dates || []) {
+          if (rel.note && editionPattern.test(rel.note)) {
+            const match = rel.note.match(/(\d+)\s*(?:min|mins|m\b)/i);
+            const runtime = match ? formatMinutes(parseInt(match[1], 10)) : null;
+            const editionName = rel.note.replace(/\(?\d+\s*(?:min\vert{}mins\vert{}m\b)\)?/i, "").trim();
+            specialCut = { editionName, runtime };
+            break;
+          }
+        }
+        if (specialCut) break;
       }
     }
 
@@ -189,9 +212,7 @@ async function getInfo(rawId, creds) {
       theatricalRuntime,
       theatrical,
       digital,
-      hasSpecialEdition: Boolean(specialEdition),
-      specialEditionName,
-      specialRuntime
+      specialCut
     };
 
     cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
@@ -219,11 +240,11 @@ function stream(info, req) {
     `💻 Digital: ${digital}`
   ];
 
-  // Only display alternate edition information if it exists, without any extra release dates
-  if (info.hasSpecialEdition && (info.specialRuntime || info.specialEditionName)) {
-    const cutTitle = info.specialEditionName || "Alternate Cut";
-    const runtimeText = info.specialRuntime ? `: ${info.specialRuntime}` : "";
-    lines.push(`✂️ ${cutTitle}${runtimeText}`);
+  // Only display alternate edition if found (no release dates, only name and runtime)
+  if (info.specialCut) {
+    const name = info.specialCut.editionName || "Alternate Cut";
+    const runtime = info.specialCut.runtime ? `: ${info.specialCut.runtime}` : "";
+    lines.push(`✂️ ${name}${runtime}`);
   }
 
   const host = req.get("host") || "localhost";
@@ -298,16 +319,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "3.5.1",
+  version: "3.6.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-dates.stream",
-    version: "3.5.1",
+    version: "3.6.0",
     name: "Release Dates",
-    description: "Shows theatrical, digital release dates and runtimes in Nuvio/Stremio.",
+    description: "Shows theatrical, digital release dates and runtimes (with IMDb extended cut search) in Nuvio/Stremio.",
     resources: [
       "stream",
       { name: "stream", types: ["movie"], idPrefixes: ["tt", "tmdb:"] }
