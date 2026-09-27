@@ -25,7 +25,6 @@ function getCredentials(configStr) {
 
   if (configStr) {
     const decoded = decodeURIComponent(configStr).trim();
-    // If the string starts with eyJ (typical JWT Bearer token) or is long, treat as Token
     if (decoded.startsWith("eyJ") || decoded.length > 50) {
       token = decoded;
       key = "";
@@ -57,6 +56,13 @@ async function tmdbGet(path, creds) {
   try { data = JSON.parse(raw); } catch { data = {}; }
   if (!r.ok) throw new Error(data.status_message || `TMDB HTTP ${r.status}`);
   return data;
+}
+
+function formatMinutes(minutes) {
+  if (!minutes || Number.isNaN(minutes) || minutes <= 0) return null;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
 function parseDate(value) {
@@ -98,6 +104,31 @@ function chooseRelease(countries, type) {
   return candidates[0] || null;
 }
 
+function findSpecialEdition(countries) {
+  const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
+  const preferred = [...new Set([DEFAULT_REGION, "US", "GB", "IN"])];
+
+  // Look in preferred regions first
+  for (const region of preferred) {
+    const country = countries.find(c => c.iso_3166_1 === region);
+    const release = (country?.release_dates || []).find(
+      x => x.note && editionPattern.test(x.note)
+    );
+    if (release) return release;
+  }
+
+  // Fallback across all available countries
+  for (const country of countries) {
+    for (const release of country.release_dates || []) {
+      if (release.note && editionPattern.test(release.note)) {
+        return release;
+      }
+    }
+  }
+
+  return null;
+}
+
 async function findMovieByImdb(imdbId, creds) {
   const find = await tmdbGet(`/find/${encodeURIComponent(imdbId)}?external_source=imdb_id`, creds);
   let movie = (find.movie_results || [])[0];
@@ -114,7 +145,8 @@ async function resolveMovie(rawId, creds) {
     return await tmdbGet(`/movie/${rawId}`, creds);
   }
   if (/^tt\d+$/i.test(rawId)) {
-    return await findMovieByImdb(rawId, creds);
+    const matched = await findMovieByImdb(rawId, creds);
+    return await tmdbGet(`/movie/${matched.id}`, creds);
   }
   throw new Error(`Unsupported ID format: ${rawId}`);
 }
@@ -132,13 +164,34 @@ async function getInfo(rawId, creds) {
     const countries = releases.results || [];
     const theatrical = chooseRelease(countries, 3);
     const digital = chooseRelease(countries, 4);
+    const specialEdition = findSpecialEdition(countries);
+
+    const theatricalRuntime = formatMinutes(movie.runtime);
+
+    let specialEditionName = null;
+    let specialRuntime = null;
+
+    if (specialEdition?.note) {
+      // Clean up the edition title removing existing bracketed minutes
+      specialEditionName = specialEdition.note.replace(/\(?\d+\s*(?:min\vert{}mins\vert{}m\b)\)?/i, "").trim();
+
+      // Check if TMDB note explicitly holds runtime (e.g., "180 min", "195 mins")
+      const match = specialEdition.note.match(/(\d+)\s*(?:min|mins|m\b)/i);
+      if (match) {
+        specialRuntime = formatMinutes(parseInt(match[1], 10));
+      }
+    }
 
     const value = {
       rawId,
       tmdbId: movie.id,
       title: movie.title || movie.original_title || rawId,
+      theatricalRuntime,
       theatrical,
-      digital
+      digital,
+      hasSpecialEdition: Boolean(specialEdition),
+      specialEditionName,
+      specialRuntime
     };
 
     cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
@@ -151,6 +204,8 @@ async function getInfo(rawId, creds) {
 }
 
 function stream(info, req) {
+  const runtimeTheatricalSuffix = info.theatricalRuntime ? ` [${info.theatricalRuntime}]` : "";
+
   const theatrical = info.theatrical
     ? `${parseDate(info.theatrical.release_date)} (${info.theatrical.region})`
     : "Not announced";
@@ -159,6 +214,18 @@ function stream(info, req) {
     ? `${parseDate(info.digital.release_date)} (${info.digital.region})`
     : "Not announced";
 
+  const lines = [
+    `🎬 Theatrical${runtimeTheatricalSuffix}: ${theatrical}`,
+    `💻 Digital: ${digital}`
+  ];
+
+  // Only display alternate edition information if it exists, without any extra release dates
+  if (info.hasSpecialEdition && (info.specialRuntime || info.specialEditionName)) {
+    const cutTitle = info.specialEditionName || "Alternate Cut";
+    const runtimeText = info.specialRuntime ? `: ${info.specialRuntime}` : "";
+    lines.push(`✂️ ${cutTitle}${runtimeText}`);
+  }
+
   const host = req.get("host") || "localhost";
   const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
   const dummyVideoUrl = `${protocol}://${host}/dummy.mp4`;
@@ -166,8 +233,8 @@ function stream(info, req) {
   return [
     {
       name: `Release Dates`,
-      title: `🎬 Theatrical: ${theatrical}\n💻 Digital: ${digital}`,
-      description: `🎬 Theatrical: ${theatrical} | 💻 Digital: ${digital}`,
+      title: lines.join("\n"),
+      description: lines.join(" | "),
       url: dummyVideoUrl,
       externalUrl: `https://www.themoviedb.org/movie/${info.tmdbId}`,
       behaviorHints: { bingeGroup: "release-dates" }
@@ -231,16 +298,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "3.4.0",
+  version: "3.5.1",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-dates.stream",
-    version: "3.4.0",
+    version: "3.5.1",
     name: "Release Dates",
-    description: "Shows theatrical and digital release dates in Nuvio/Stremio.",
+    description: "Shows theatrical, digital release dates and runtimes in Nuvio/Stremio.",
     resources: [
       "stream",
       { name: "stream", types: ["movie"], idPrefixes: ["tt", "tmdb:"] }
