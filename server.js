@@ -104,41 +104,57 @@ function chooseRelease(countries, type) {
   return candidates[0] || null;
 }
 
-// Scrapes IMDb Technical Specs for alternate cut running times
-async function fetchImdbAltRuntimes(imdbId) {
+// Queries Wikidata SPARQL API by IMDb ID (Wikidata allows automated server requests & does not block datacenter IPs)
+async function fetchWikidataAltRuntimes(imdbId) {
   if (!/^tt\d+$/i.test(imdbId)) return null;
 
+  const query = `
+    SELECT ?duration ?statementLabel WHERE {
+      ?movie wdt:P345 "${imdbId}".
+      ?movie p:P2047 ?statement.
+      ?statement ps:P2047 ?duration.
+      OPTIONAL { ?statement pq:P1480 ?statementLabel. }
+      OPTIONAL { ?statement pq:P459 ?statementLabel. }
+    } LIMIT 5
+  `;
+
   try {
-    const res = await fetch(`https://www.imdb.com/title/${imdbId}/technical/`, {
+    const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
+    const res = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9"
+        "User-Agent": "ReleaseDatesStremioAddon/3.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
       }
     });
 
     if (!res.ok) return null;
-    const html = await res.text();
+    const json = await res.json();
+    const bindings = json?.results?.bindings || [];
 
-    const pattern = /(\d+)\s*(?:hr|hours?|h)\s*(?:(\d+)\s*(?:min|minutes?|m))?\s*(?:\((\d+)\s*min\))?\s*\(([^)]+)\)/gi;
-    let match;
-    const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
+    // Collect all runtimes in minutes
+    const runtimes = [];
+    for (const b of bindings) {
+      const minutes = parseFloat(b?.duration?.value);
+      if (minutes && !isNaN(minutes)) {
+        runtimes.push(Math.round(minutes));
+      }
+    }
 
-    while ((match = pattern.exec(html)) !== null) {
-      const hours = parseInt(match[1], 10) || 0;
-      const mins = parseInt(match[2], 10) || 0;
-      const explicitTotalMin = parseInt(match[3], 10);
-      const label = match[4].trim();
+    if (runtimes.length > 1) {
+      const unique = [...new Set(runtimes)].sort((a, b) => a - b);
+      // The longest recorded runtime corresponds to the extended/director's edition
+      const maxMinutes = unique[unique.length - 1];
+      const minMinutes = unique[0];
 
-      if (editionPattern.test(label)) {
-        const totalMinutes = explicitTotalMin || (hours * 60 + mins);
+      // Only treat it as an extended cut if there is at least a 3-minute difference
+      if (maxMinutes - minMinutes >= 3) {
         return {
-          editionName: label,
-          runtime: formatMinutes(totalMinutes)
+          editionName: "Extended Cut",
+          runtime: formatMinutes(maxMinutes)
         };
       }
     }
-  } catch (err) {
-    console.warn(`[IMDb Scrape] Failed for ${imdbId}: ${err.message}`);
+  } catch (e) {
+    console.warn(`[Wikidata Query Error for ${imdbId}]: ${e.message}`);
   }
 
   return null;
@@ -185,23 +201,30 @@ async function getInfo(rawId, creds) {
 
     const theatricalRuntime = formatMinutes(movie.runtime);
 
-    // 1. First, search IMDb for alternate edition running time
-    let specialCut = imdbId ? await fetchImdbAltRuntimes(imdbId) : null;
-
-    // 2. Fallback to TMDB release notes if IMDb didn't list one
-    if (!specialCut) {
-      const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
-      for (const country of countries) {
-        for (const rel of country.release_dates || []) {
-          if (rel.note && editionPattern.test(rel.note)) {
-            const match = rel.note.match(/(\d+)\s*(?:min|mins|m\b)/i);
-            const runtime = match ? formatMinutes(parseInt(match[1], 10)) : null;
-            const editionName = rel.note.replace(/\(?\d+\s*(?:min\vert{}mins\vert{}m\b)\)?/i, "").trim();
-            specialCut = { editionName, runtime };
-            break;
-          }
+    // 1. Check TMDB release notes first for explicitly mentioned cuts
+    let specialCut = null;
+    const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
+    for (const country of countries) {
+      for (const rel of country.release_dates || []) {
+        if (rel.note && editionPattern.test(rel.note)) {
+          const match = rel.note.match(/(\d+)\s*(?:min|mins|m\b)/i);
+          const runtime = match ? formatMinutes(parseInt(match[1], 10)) : null;
+          const editionName = rel.note.replace(/\(?\d+\s*(?:min\vert{}mins\vert{}m\b)\)?/i, "").trim();
+          specialCut = { editionName, runtime };
+          break;
         }
-        if (specialCut) break;
+      }
+      if (specialCut) break;
+    }
+
+    // 2. If no runtime was explicitly in TMDB notes, query Wikidata via IMDb ID
+    if ((!specialCut || !specialCut.runtime) && imdbId) {
+      const wikiData = await fetchWikidataAltRuntimes(imdbId);
+      if (wikiData) {
+        specialCut = {
+          editionName: specialCut?.editionName || wikiData.editionName,
+          runtime: wikiData.runtime
+        };
       }
     }
 
@@ -240,9 +263,9 @@ function stream(info, req) {
     `💻 Digital: ${digital}`
   ];
 
-  // Only display alternate edition if found (no release dates, only name and runtime)
+  // Only display alternate cut if one exists (with its runtime if found)
   if (info.specialCut) {
-    const name = info.specialCut.editionName || "Alternate Cut";
+    const name = info.specialCut.editionName || "Extended Cut";
     const runtime = info.specialCut.runtime ? `: ${info.specialCut.runtime}` : "";
     lines.push(`✂️ ${name}${runtime}`);
   }
@@ -319,16 +342,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "3.6.0",
+  version: "3.7.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-dates.stream",
-    version: "3.6.0",
+    version: "3.7.0",
     name: "Release Dates",
-    description: "Shows theatrical, digital release dates and runtimes (with IMDb extended cut search) in Nuvio/Stremio.",
+    description: "Shows theatrical, digital release dates and runtimes (including extended cuts via Wikidata) in Nuvio/Stremio.",
     resources: [
       "stream",
       { name: "stream", types: ["movie"], idPrefixes: ["tt", "tmdb:"] }
