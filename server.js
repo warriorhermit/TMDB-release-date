@@ -104,17 +104,15 @@ function chooseRelease(countries, type) {
   return candidates[0] || null;
 }
 
-// Queries Wikidata SPARQL API by IMDb ID (Wikidata allows automated server requests & does not block datacenter IPs)
+// Queries Wikidata SPARQL API by IMDb ID for alternate cuts
 async function fetchWikidataAltRuntimes(imdbId) {
   if (!/^tt\d+$/i.test(imdbId)) return null;
 
   const query = `
-    SELECT ?duration ?statementLabel WHERE {
+    SELECT ?duration WHERE {
       ?movie wdt:P345 "${imdbId}".
       ?movie p:P2047 ?statement.
       ?statement ps:P2047 ?duration.
-      OPTIONAL { ?statement pq:P1480 ?statementLabel. }
-      OPTIONAL { ?statement pq:P459 ?statementLabel. }
     } LIMIT 5
   `;
 
@@ -122,7 +120,7 @@ async function fetchWikidataAltRuntimes(imdbId) {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
       headers: {
-        "User-Agent": "ReleaseDatesStremioAddon/3.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
+        "User-Agent": "ReleaseInfoAddon/3.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
       }
     });
 
@@ -130,7 +128,6 @@ async function fetchWikidataAltRuntimes(imdbId) {
     const json = await res.json();
     const bindings = json?.results?.bindings || [];
 
-    // Collect all runtimes in minutes
     const runtimes = [];
     for (const b of bindings) {
       const minutes = parseFloat(b?.duration?.value);
@@ -141,11 +138,9 @@ async function fetchWikidataAltRuntimes(imdbId) {
 
     if (runtimes.length > 1) {
       const unique = [...new Set(runtimes)].sort((a, b) => a - b);
-      // The longest recorded runtime corresponds to the extended/director's edition
       const maxMinutes = unique[unique.length - 1];
       const minMinutes = unique[0];
 
-      // Only treat it as an extended cut if there is at least a 3-minute difference
       if (maxMinutes - minMinutes >= 3) {
         return {
           editionName: "Extended Cut",
@@ -201,7 +196,7 @@ async function getInfo(rawId, creds) {
 
     const theatricalRuntime = formatMinutes(movie.runtime);
 
-    // 1. Check TMDB release notes first for explicitly mentioned cuts
+    // Check TMDB notes first
     let specialCut = null;
     const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
     for (const country of countries) {
@@ -217,7 +212,7 @@ async function getInfo(rawId, creds) {
       if (specialCut) break;
     }
 
-    // 2. If no runtime was explicitly in TMDB notes, query Wikidata via IMDb ID
+    // Fallback to Wikidata
     if ((!specialCut || !specialCut.runtime) && imdbId) {
       const wikiData = await fetchWikidataAltRuntimes(imdbId);
       if (wikiData) {
@@ -263,7 +258,6 @@ function stream(info, req) {
     `💻 Digital: ${digital}`
   ];
 
-  // Only display alternate cut if one exists (with its runtime if found)
   if (info.specialCut) {
     const name = info.specialCut.editionName || "Extended Cut";
     const runtime = info.specialCut.runtime ? `: ${info.specialCut.runtime}` : "";
@@ -276,12 +270,12 @@ function stream(info, req) {
 
   return [
     {
-      name: `Release Dates`,
+      name: `Release Info`,
       title: lines.join("\n"),
       description: lines.join(" | "),
       url: dummyVideoUrl,
       externalUrl: `https://www.themoviedb.org/movie/${info.tmdbId}`,
-      behaviorHints: { bingeGroup: "release-dates" }
+      behaviorHints: { bingeGroup: "release-info" }
     }
   ];
 }
@@ -291,7 +285,7 @@ app.get("/dummy.mp4", (_req, res) => {
   res.type("video/mp4").status(204).end();
 });
 
-// HTML Configuration UI
+// HTML Configuration UI with Copy Button
 app.get("/", (_req, res) => {
   res.type("html").send(`
     <!DOCTYPE html>
@@ -299,7 +293,7 @@ app.get("/", (_req, res) => {
     <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Configure Release Dates Addon</title>
+      <title>Configure Release Info Addon</title>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
         .card { background: #1e293b; padding: 2.5rem; border-radius: 12px; width: 100%; max-width: 480px; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5); }
@@ -307,22 +301,25 @@ app.get("/", (_req, res) => {
         p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; }
         label { display: block; margin-top: 1.25rem; font-weight: 500; font-size: 0.9rem; }
         input[type="text"] { width: 100%; padding: 0.75rem; margin-top: 0.5rem; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; font-size: 0.9rem; }
-        button { width: 100%; padding: 0.75rem; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: 600; margin-top: 1.5rem; cursor: pointer; transition: background 0.2s; }
-        button:hover { background: #0369a1; }
+        .btn-primary { width: 100%; padding: 0.75rem; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: 600; margin-top: 1.5rem; cursor: pointer; transition: background 0.2s; }
+        .btn-primary:hover { background: #0369a1; }
         .result { margin-top: 1.5rem; display: none; }
         .manifest-link { word-break: break-all; background: #0f172a; padding: 0.75rem; border-radius: 6px; font-family: monospace; font-size: 0.85rem; border: 1px solid #334155; margin-top: 0.5rem; color: #a5f3fc; }
+        .btn-copy { width: 100%; padding: 0.65rem; background: #334155; color: #f8fafc; border: none; border-radius: 6px; font-weight: 600; margin-top: 0.75rem; cursor: pointer; transition: background 0.2s; }
+        .btn-copy:hover { background: #475569; }
       </style>
     </head>
     <body>
       <div class="card">
-        <h1>Release Dates Addon</h1>
+        <h1>Release Info Addon</h1>
         <p>Enter your TMDB API Read Access Token or API Key below to generate your custom manifest URL for Nuvio and Stremio.</p>
         <label for="token">TMDB API Token / Key</label>
         <input type="text" id="token" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
-        <button onclick="generateManifest()">Generate Manifest URL</button>
+        <button class="btn-primary" onclick="generateManifest()">Generate Manifest URL</button>
         <div class="result" id="resultBlock">
           <label>Your Manifest URL:</label>
           <div class="manifest-link" id="manifestUrl"></div>
+          <button class="btn-copy" id="copyBtn" onclick="copyManifest()">📋 Copy Manifest URL</button>
         </div>
       </div>
       <script>
@@ -333,6 +330,19 @@ app.get("/", (_req, res) => {
           const url = window.location.origin + "/" + encoded + "/manifest.json";
           document.getElementById("manifestUrl").innerText = url;
           document.getElementById("resultBlock").style.display = "block";
+          document.getElementById("copyBtn").innerText = "📋 Copy Manifest URL";
+        }
+
+        async function copyManifest() {
+          const url = document.getElementById("manifestUrl").innerText;
+          try {
+            await navigator.clipboard.writeText(url);
+            const btn = document.getElementById("copyBtn");
+            btn.innerText = "✅ Copied to Clipboard!";
+            setTimeout(() => { btn.innerText = "📋 Copy Manifest URL"; }, 2500);
+          } catch (err) {
+            alert("Failed to copy. Please manually select and copy the URL.");
+          }
         }
       </script>
     </body>
@@ -342,16 +352,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "3.7.0",
+  version: "3.8.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
-    id: "com.nuvio.release-dates.stream",
-    version: "3.7.0",
-    name: "Release Dates",
-    description: "Shows theatrical, digital release dates and runtimes (including extended cuts via Wikidata) in Nuvio/Stremio.",
+    id: "com.nuvio.release-info.stream",
+    version: "3.8.0",
+    name: "Release Info",
+    description: "Shows theatrical, digital release dates and runtimes in Nuvio/Stremio.",
     resources: [
       "stream",
       { name: "stream", types: ["movie"], idPrefixes: ["tt", "tmdb:"] }
@@ -381,7 +391,7 @@ async function handleStream(req, res) {
     const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
     return res.json({
       streams: [{
-        name: "⚠️ Release Dates",
+        name: "⚠️ Release Info",
         title: "TMDB API credentials missing. Please configure the addon.",
         description: "Missing API token/key.",
         url: `${protocol}://${host}/dummy.mp4`,
@@ -399,7 +409,7 @@ async function handleStream(req, res) {
     const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
     return res.json({
       streams: [{
-        name: "⚠️ Release Dates",
+        name: "⚠️ Release Info",
         title: `Error: ${e.message}`,
         description: e.message,
         url: `${protocol}://${host}/dummy.mp4`,
@@ -413,4 +423,4 @@ app.get("/stream/:type/:id.json", handleStream);
 app.get("/:config/stream/:type/:id.json", handleStream);
 app.get("/:style/:apiKey/stream/:type/:id.json", handleStream);
 
-app.listen(PORT, () => console.log(`Release Dates addon listening on ${PORT}`));
+app.listen(PORT, () => console.log(`Release Info addon listening on ${PORT}`));
