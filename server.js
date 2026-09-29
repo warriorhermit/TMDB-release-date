@@ -104,62 +104,13 @@ function chooseRelease(countries, type) {
   return candidates[0] || null;
 }
 
-// Queries Wikidata SPARQL API by IMDb ID for alternate cuts
-async function fetchWikidataAltRuntimes(imdbId) {
-  if (!/^tt\d+$/i.test(imdbId)) return null;
-
-  const query = `
-    SELECT ?duration WHERE {
-      ?movie wdt:P345 "${imdbId}".
-      ?movie p:P2047 ?statement.
-      ?statement ps:P2047 ?duration.
-    } LIMIT 5
-  `;
-
-  try {
-    const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "ReleaseInfoAddon/3.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
-      }
-    });
-
-    if (!res.ok) return null;
-    const json = await res.json();
-    const bindings = json?.results?.bindings || [];
-
-    const runtimes = [];
-    for (const b of bindings) {
-      const minutes = parseFloat(b?.duration?.value);
-      if (minutes && !isNaN(minutes)) {
-        runtimes.push(Math.round(minutes));
-      }
-    }
-
-    if (runtimes.length > 1) {
-      const unique = [...new Set(runtimes)].sort((a, b) => a - b);
-      const maxMinutes = unique[unique.length - 1];
-      const minMinutes = unique[0];
-
-      if (maxMinutes - minMinutes >= 3) {
-        return {
-          editionName: "Extended Cut",
-          runtime: formatMinutes(maxMinutes)
-        };
-      }
-    }
-  } catch (e) {
-    console.warn(`[Wikidata Query Error for ${imdbId}]: ${e.message}`);
-  }
-
-  return null;
-}
-
-async function findMovieByImdb(imdbId, creds) {
+async function findByImdb(imdbId, creds) {
   const find = await tmdbGet(`/find/${encodeURIComponent(imdbId)}?external_source=imdb_id`, creds);
-  let movie = (find.movie_results || [])[0];
-  if (movie?.id) return movie;
-  throw new Error(`TMDB could not map IMDb ID ${imdbId} to a movie`);
+  const movie = (find.movie_results || [])[0];
+  if (movie?.id) return { id: movie.id, type: "movie" };
+  const tv = (find.tv_results || [])[0];
+  if (tv?.id) return { id: tv.id, type: "tv" };
+  throw new Error(`TMDB could not map IMDb ID ${imdbId}`);
 }
 
 async function resolveMovie(rawId, creds) {
@@ -173,15 +124,25 @@ async function resolveMovie(rawId, creds) {
     return { movie, imdbId: movie.imdb_id || null };
   }
   if (/^tt\d+$/i.test(rawId)) {
-    const matched = await findMovieByImdb(rawId, creds);
-    const movie = await tmdbGet(`/movie/${matched.id}`, creds);
+    const found = await findByImdb(rawId, creds);
+    const movie = await tmdbGet(`/movie/${found.id}`, creds);
     return { movie, imdbId: rawId };
   }
   throw new Error(`Unsupported ID format: ${rawId}`);
 }
 
-async function getInfo(rawId, creds) {
-  const cacheKey = `${creds.token || creds.key}:${rawId}`;
+async function resolveTvShowId(rawId, creds) {
+  if (rawId.startsWith("tmdb:")) return rawId.replace("tmdb:", "");
+  if (/^\d+$/.test(rawId)) return rawId;
+  if (/^tt\d+$/i.test(rawId)) {
+    const found = await findByImdb(rawId, creds);
+    return found.id;
+  }
+  throw new Error(`Unsupported TV Show ID: ${rawId}`);
+}
+
+async function getMovieInfo(rawId, creds) {
+  const cacheKey = `movie:${creds.token || creds.key}:${rawId}`;
   const cached = cache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.value;
   if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
@@ -196,7 +157,6 @@ async function getInfo(rawId, creds) {
 
     const theatricalRuntime = formatMinutes(movie.runtime);
 
-    // Check TMDB notes first
     let specialCut = null;
     const editionPattern = /director|extended|unrated|special edition|ultimate|alternate|uncut/i;
     for (const country of countries) {
@@ -212,18 +172,8 @@ async function getInfo(rawId, creds) {
       if (specialCut) break;
     }
 
-    // Fallback to Wikidata
-    if ((!specialCut || !specialCut.runtime) && imdbId) {
-      const wikiData = await fetchWikidataAltRuntimes(imdbId);
-      if (wikiData) {
-        specialCut = {
-          editionName: specialCut?.editionName || wikiData.editionName,
-          runtime: wikiData.runtime
-        };
-      }
-    }
-
     const value = {
+      type: "movie",
       rawId,
       tmdbId: movie.id,
       title: movie.title || movie.original_title || rawId,
@@ -242,7 +192,73 @@ async function getInfo(rawId, creds) {
   finally { activeRequests.delete(cacheKey); }
 }
 
-function stream(info, req) {
+async function getEpisodeInfo(seriesRawId, season, episode, creds) {
+  const cacheKey = `tv:${creds.token || creds.key}:${seriesRawId}:${season}:${episode}`;
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) return cached.value;
+  if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
+
+  const promise = (async () => {
+    const tvId = await resolveTvShowId(seriesRawId, creds);
+    const epData = await tmdbGet(`/tv/${tvId}/season/${season}/episode/${episode}`, creds);
+
+    const airDate = parseDate(epData.air_date);
+    const runtime = formatMinutes(epData.runtime);
+
+    // Check if the episode itself is an alternate cut
+    let specialCut = null;
+    const editionPattern = /director|extended|unrated|special edition|alternate|superfan/i;
+
+    if (epData.name && editionPattern.test(epData.name)) {
+      specialCut = { editionName: epData.name, runtime };
+    } else if (epData.overview && editionPattern.test(epData.overview)) {
+      const match = epData.overview.match(/(\d+)\s*(?:min|mins|m\b)/i);
+      const altRuntime = match ? formatMinutes(parseInt(match[1], 10)) : null;
+      specialCut = { editionName: "Extended Cut", runtime: altRuntime };
+    }
+
+    // If not found in the episode details, check Season 0 (Specials) for an extended version
+    if (!specialCut) {
+      try {
+        const specials = await tmdbGet(`/tv/${tvId}/season/0`, creds);
+        const epTitleNorm = (epData.name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+        for (const spec of specials.episodes || []) {
+          const specNameNorm = (spec.name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+          if (editionPattern.test(spec.name) && (specNameNorm.includes(epTitleNorm) || specNameNorm.includes(`s${season}e${episode}`))) {
+            specialCut = {
+              editionName: spec.name.trim(),
+              runtime: formatMinutes(spec.runtime)
+            };
+            break;
+          }
+        }
+      } catch {
+        // Season 0 might not exist for some shows
+      }
+    }
+
+    const value = {
+      type: "series",
+      tvId,
+      season,
+      episode,
+      title: epData.name || `S${season}E${episode}`,
+      airDate,
+      runtime,
+      specialCut
+    };
+
+    cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
+    return value;
+  })();
+
+  activeRequests.set(cacheKey, promise);
+  try { return await promise; }
+  finally { activeRequests.delete(cacheKey); }
+}
+
+function streamMovie(info, req) {
   const runtimeTheatricalSuffix = info.theatricalRuntime ? ` [${info.theatricalRuntime}]` : "";
 
   const theatrical = info.theatrical
@@ -275,6 +291,36 @@ function stream(info, req) {
       description: lines.join(" | "),
       url: dummyVideoUrl,
       externalUrl: `https://www.themoviedb.org/movie/${info.tmdbId}`,
+      behaviorHints: { bingeGroup: "release-info" }
+    }
+  ];
+}
+
+function streamEpisode(info, req) {
+  const runtimeSuffix = info.runtime ? ` [${info.runtime}]` : "";
+  const airDate = info.airDate ? info.airDate : "Not announced";
+
+  const lines = [
+    `📺 Air Date${runtimeSuffix}: ${airDate}`
+  ];
+
+  if (info.specialCut) {
+    const name = info.specialCut.editionName || "Extended Cut";
+    const runtime = info.specialCut.runtime ? `: ${info.specialCut.runtime}` : "";
+    lines.push(`✂️ ${name}${runtime}`);
+  }
+
+  const host = req.get("host") || "localhost";
+  const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
+  const dummyVideoUrl = `${protocol}://${host}/dummy.mp4`;
+
+  return [
+    {
+      name: `Release Info`,
+      title: lines.join("\n"),
+      description: lines.join(" | "),
+      url: dummyVideoUrl,
+      externalUrl: `https://www.themoviedb.org/tv/${info.tvId}/season/${info.season}/episode/${info.episode}`,
       behaviorHints: { bingeGroup: "release-info" }
     }
   ];
@@ -352,21 +398,21 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "3.8.0",
+  version: "4.0.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "3.8.0",
+    version: "4.0.0",
     name: "Release Info",
-    description: "Shows theatrical, digital release dates and runtimes in Nuvio/Stremio.",
+    description: "Shows release dates and runtimes (including extended cuts) for Movies & TV series in Nuvio/Stremio.",
     resources: [
       "stream",
-      { name: "stream", types: ["movie"], idPrefixes: ["tt", "tmdb:"] }
+      { name: "stream", types: ["movie", "series"], idPrefixes: ["tt", "tmdb:"] }
     ],
-    types: ["movie"],
+    types: ["movie", "series"],
     idPrefixes: ["tt", "tmdb:"],
     catalogs: []
   };
@@ -376,14 +422,8 @@ app.get("/manifest.json", (_req, res) => res.json(getManifestJson()));
 app.get("/:config/manifest.json", (_req, res) => res.json(getManifestJson()));
 
 async function handleStream(req, res) {
-  if (req.params.type !== "movie") return res.json({ streams: [] });
-
-  let rawId = String(req.params.id);
-  if (rawId.startsWith("tmdb:")) {
-    rawId = "tmdb:" + rawId.slice(5).split(":")[0];
-  } else {
-    rawId = rawId.split(":")[0];
-  }
+  const { type, id } = req.params;
+  if (type !== "movie" && type !== "series") return res.json({ streams: [] });
 
   const creds = getCredentials(req.params.config);
   if (!creds.token && !creds.key) {
@@ -401,10 +441,44 @@ async function handleStream(req, res) {
   }
 
   try {
-    const info = await getInfo(rawId, creds);
-    return res.json({ streams: stream(info, req) });
+    if (type === "movie") {
+      let rawId = String(id);
+      if (rawId.startsWith("tmdb:")) {
+        rawId = "tmdb:" + rawId.slice(5).split(":")[0];
+      } else {
+        rawId = rawId.split(":")[0];
+      }
+
+      const info = await getMovieInfo(rawId, creds);
+      return res.json({ streams: streamMovie(info, req) });
+    }
+
+    if (type === "series") {
+      // Stremio/Nuvio series format: [id]:[season]:[episode]
+      const parts = String(id).split(":");
+      let seriesRawId;
+      let season;
+      let episode;
+
+      if (id.startsWith("tmdb:")) {
+        seriesRawId = "tmdb:" + parts[1];
+        season = parseInt(parts[2], 10);
+        episode = parseInt(parts[3], 10);
+      } else {
+        seriesRawId = parts[0];
+        season = parseInt(parts[1], 10);
+        episode = parseInt(parts[2], 10);
+      }
+
+      if (Number.isNaN(season) || Number.isNaN(episode)) {
+        return res.json({ streams: [] });
+      }
+
+      const info = await getEpisodeInfo(seriesRawId, season, episode, creds);
+      return res.json({ streams: streamEpisode(info, req) });
+    }
   } catch (e) {
-    console.error(`[${rawId}] ${e.message}`);
+    console.error(`[${type}:${id}] ${e.message}`);
     const host = req.get("host") || "localhost";
     const protocol = req.protocol === "https" || req.get("x-forwarded-proto") === "https" ? "https" : "http";
     return res.json({
