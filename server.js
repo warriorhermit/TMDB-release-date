@@ -11,64 +11,69 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 21600000);
 const cache = new Map();
 const activeRequests = new Map();
 
-// Known TV show ID translations when TMDB /find endpoint is unindexed or failing
+// Known TV show ID translations when TMDB /find endpoint is unindexed
 const KNOWN_IMDB_TO_TMDB = {
-  "tt26540674": "219847" // Lanterns (HBO / DC Studios)
+  "tt26540674": "219847", // Lanterns (HBO / DC Studios)
+  "tt2375692":  "49010"   // Black Sails
 };
 
 // Curated dictionary for legendary movie alternate/extended cuts with running times
 const KNOWN_MOVIE_CUTS = {
-  // The Lord of the Rings
-  "120": { editionName: "Extended Edition", runtime: "3h 48m" }, // Fellowship
-  "121": { editionName: "Extended Edition", runtime: "3h 55m" }, // Two Towers
-  "122": { editionName: "Extended Edition", runtime: "4h 11m" }, // Return of the King
-
-  // The Hobbit
-  "49051":  { editionName: "Extended Edition", runtime: "3h 02m" }, // An Unexpected Journey
-  "57158":  { editionName: "Extended Edition", runtime: "3h 06m" }, // Desolation of Smaug
-  "122917": { editionName: "Extended Edition", runtime: "2h 44m" }, // Battle of the Five Armies
-
-  // Zack Snyder's Justice League
-  "791373": { editionName: "Director's Cut", runtime: "4h 02m" },
-
-  // Kingdom of Heaven
-  "1495": { editionName: "Director's Cut", runtime: "3h 14m" },
-
-  // Avatar
-  "19995": { editionName: "Extended Collector's Edition", runtime: "2h 58m" },
-
-  // Blade Runner
-  "78": { editionName: "The Final Cut", runtime: "1h 57m" },
-
-  // Aliens
-  "679": { editionName: "Special Edition", runtime: "2h 34m" },
-
-  // Apocalypse Now
-  "28": { editionName: "Redux", runtime: "3h 16m" }
+  "120":    { editionName: "Extended Edition", runtime: "3h 48m" }, // LOTR: Fellowship
+  "121":    { editionName: "Extended Edition", runtime: "3h 55m" }, // LOTR: Two Towers
+  "122":    { editionName: "Extended Edition", runtime: "4h 11m" }, // LOTR: Return of the King
+  "49051":  { editionName: "Extended Edition", runtime: "3h 02m" }, // Hobbit 1
+  "57158":  { editionName: "Extended Edition", runtime: "3h 06m" }, // Hobbit 2
+  "122917": { editionName: "Extended Edition", runtime: "2h 44m" }, // Hobbit 3
+  "791373": { editionName: "Director's Cut",   runtime: "4h 02m" }, // Snyder Cut
+  "1495":   { editionName: "Director's Cut",   runtime: "3h 14m" }, // Kingdom of Heaven
+  "19995":  { editionName: "Extended Collector's Edition", runtime: "2h 58m" }, // Avatar
+  "78":     { editionName: "The Final Cut",    runtime: "1h 57m" }, // Blade Runner
+  "679":    { editionName: "Special Edition",  runtime: "2h 34m" }, // Aliens
+  "28":     { editionName: "Redux",            runtime: "3h 16m" }  // Apocalypse Now
 };
 
 // Curated dictionary for legendary TV alternate cuts
 const KNOWN_TV_CUTS = {
-  // Battlestar Galactica (2003) - TMDB ID: 1972
-  "1972:2:10": { editionName: "Extended Cut", runtime: "59m" }, // Pegasus
-  "1972:3:9":  { editionName: "Extended Cut", runtime: "1h 10m" }, // Unfinished Business
-  "1972:4:18": { editionName: "Extended Cut", runtime: "1h 07m" }, // Islanded in a Stream of Stars
-  "1972:4:20": { editionName: "Extended Finale", runtime: "2h 32m" } // Daybreak
+  "1972:2:10": { editionName: "Extended Cut", runtime: "59m" },    // BSG Pegasus
+  "1972:3:9":  { editionName: "Extended Cut", runtime: "1h 10m" }, // BSG Unfinished Business
+  "1972:4:18": { editionName: "Extended Cut", runtime: "1h 07m" }, // BSG Islanded in a Stream of Stars
+  "1972:4:20": { editionName: "Extended Finale", runtime: "2h 32m" } // BSG Daybreak
 };
 
-// Curated backup for notable adaptations / revivals
+// Curated backup for notable adaptations / continuity / pre-release titles
 const KNOWN_SERIES_CONTINUITY = {
+  // Lanterns (HBO / DC Studios)
   "219847": {
+    title: "Lanterns",
     franchise: "DC Universe",
-    basedOn: "Green Lantern by John Broome & Gil Kane (DC Comics)"
+    basedOn: "Green Lantern by John Broome & Gil Kane (DC Comics)",
+    expectedAir: "Expected 2026",
+    wikiUrl: "https://en.wikipedia.org/wiki/Lanterns_(TV_series)"
   },
   "tt26540674": {
+    title: "Lanterns",
     franchise: "DC Universe",
-    basedOn: "Green Lantern by John Broome & Gil Kane (DC Comics)"
+    basedOn: "Green Lantern by John Broome & Gil Kane (DC Comics)",
+    expectedAir: "Expected 2026",
+    wikiUrl: "https://en.wikipedia.org/wiki/Lanterns_(TV_series)"
   },
+  // Black Sails (Prequel to Treasure Island)
+  "49010": {
+    franchise: "Treasure Island Universe",
+    basedOn: "Prequel to 'Treasure Island' by Robert Louis Stevenson",
+    wikiUrl: "https://en.wikipedia.org/wiki/Black_Sails_(TV_series)"
+  },
+  "tt2375692": {
+    franchise: "Treasure Island Universe",
+    basedOn: "Prequel to 'Treasure Island' by Robert Louis Stevenson",
+    wikiUrl: "https://en.wikipedia.org/wiki/Black_Sails_(TV_series)"
+  },
+  // Scrubs Revival
   "scrubs": {
     franchise: "Scrubs Universe",
-    revivalOf: "Revival of Scrubs (2001–2010)"
+    revivalOf: "Revival of Scrubs (2001–2010)",
+    wikiUrl: "https://en.wikipedia.org/wiki/Scrubs_(TV_series)"
   }
 };
 
@@ -138,15 +143,16 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
     : "https://en.wikipedia.org/";
 
   if (!imdbId || !/^tt\d+$/i.test(imdbId)) {
-    return { franchise: null, basedOn: null, follows: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
   }
 
   const query = `
-    SELECT ?franchiseLabel ?basedOnLabel ?followsLabel ?partOfLabel ?article ?duration ?editionLabel WHERE {
+    SELECT ?franchiseLabel ?basedOnLabel ?followsLabel ?followedByLabel ?partOfLabel ?article ?duration ?editionLabel WHERE {
       ?item wdt:P345 "${imdbId}".
       OPTIONAL { ?item wdt:P179 ?franchise. }
       OPTIONAL { ?item wdt:P144 ?basedOn. }
       OPTIONAL { ?item wdt:P155 ?follows. }
+      OPTIONAL { ?item wdt:P156 ?followedBy. }
       OPTIONAL { ?item wdt:P361 ?partOf. }
       OPTIONAL {
         ?item p:P2047 ?durStatement.
@@ -164,20 +170,19 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: {
-        "User-Agent": "ReleaseInfoAddon/5.6 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
-      }
+      headers: { "User-Agent": "ReleaseInfoAddon/5.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
-    if (!res.ok) return { franchise: null, basedOn: null, follows: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
     const json = await res.json();
     const bindings = json?.results?.bindings || [];
-    if (bindings.length === 0) return { franchise: null, basedOn: null, follows: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    if (bindings.length === 0) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
 
     const first = bindings[0];
     const franchise = first?.franchiseLabel?.value;
     const basedOn = first?.basedOnLabel?.value;
     const follows = first?.followsLabel?.value;
+    const followedBy = first?.followedByLabel?.value;
     const partOf = first?.partOfLabel?.value;
     const wikiUrl = first?.article?.value || defaultWikiUrl;
 
@@ -189,10 +194,8 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
       const parsedDur = parseFloat(b.duration.value);
       if (Number.isNaN(parsedDur) || parsedDur <= 0) continue;
 
-      // Durations in Wikidata can be in minutes or seconds (if > 500, assume seconds)
       const minutes = parsedDur > 500 ? Math.round(parsedDur / 60) : Math.round(parsedDur);
 
-      // Check if this duration is at least 3 minutes longer than theatrical cut
       if (theatricalMin > 0 && minutes >= theatricalMin + 3) {
         const editionName = b.editionLabel?.value && !b.editionLabel.value.startsWith("Q")
           ? b.editionLabel.value
@@ -206,12 +209,13 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
       franchise: franchise && !franchise.startsWith("Q") ? franchise : (partOf && !partOf.startsWith("Q") ? partOf : null),
       basedOn: basedOn && !basedOn.startsWith("Q") ? basedOn : null,
       follows: follows && !follows.startsWith("Q") ? follows : null,
+      followedBy: followedBy && !followedBy.startsWith("Q") ? followedBy : null,
       specialCut,
       wikiUrl
     };
   } catch (err) {
     console.warn(`[Wikidata Movie Error for ${imdbId}]: ${err.message}`);
-    return { franchise: null, basedOn: null, follows: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
   }
 }
 
@@ -221,16 +225,17 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
     : "https://en.wikipedia.org/";
 
   if (!imdbId || !/^tt\d+$/i.test(imdbId)) {
-    return { franchise: null, basedOn: null, follows: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
   }
 
   const query = `
-    SELECT ?franchiseLabel ?basedOnLabel ?followsLabel ?partOfLabel ?article
+    SELECT ?franchiseLabel ?basedOnLabel ?followsLabel ?followedByLabel ?partOfLabel ?article
            ?predecessorLabel (YEAR(?origStart) AS ?origStartY) (YEAR(?origEnd) AS ?origEndY) WHERE {
       ?item wdt:P345 "${imdbId}".
       OPTIONAL { ?item wdt:P179 ?franchise. }
       OPTIONAL { ?item wdt:P144 ?basedOn. }
       OPTIONAL { ?item wdt:P155 ?follows. }
+      OPTIONAL { ?item wdt:P156 ?followedBy. }
       OPTIONAL { ?item wdt:P361 ?partOf. }
       OPTIONAL {
         { ?item wdt:P155 ?predecessor. } UNION { ?item wdt:P144 ?predecessor. }
@@ -248,18 +253,17 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: {
-        "User-Agent": "ReleaseInfoAddon/5.6 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
-      }
+      headers: { "User-Agent": "ReleaseInfoAddon/5.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
-    if (!res.ok) return { franchise: null, basedOn: null, follows: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
     const json = await res.json();
     const binding = json?.results?.bindings?.[0];
 
     const franchise = binding?.franchiseLabel?.value;
     const basedOn = binding?.basedOnLabel?.value;
     const follows = binding?.followsLabel?.value;
+    const followedBy = binding?.followedByLabel?.value;
     const partOf = binding?.partOfLabel?.value;
     const wikiUrl = binding?.article?.value || defaultWikiUrl;
 
@@ -277,12 +281,13 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
       franchise: franchise && !franchise.startsWith("Q") ? franchise : (partOf && !partOf.startsWith("Q") ? partOf : null),
       basedOn: basedOn && !basedOn.startsWith("Q") ? basedOn : null,
       follows: follows && !follows.startsWith("Q") ? follows : null,
+      followedBy: followedBy && !followedBy.startsWith("Q") ? followedBy : null,
       revivalOf,
       wikiUrl
     };
   } catch (err) {
     console.warn(`[Wikidata Details Error for ${imdbId}]: ${err.message}`);
-    return { franchise: null, basedOn: null, follows: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
   }
 }
 
@@ -291,9 +296,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
 async function getTvdbToken(apiKey) {
   if (!apiKey) return null;
   const now = Date.now();
-  if (tvdbJwtToken && tvdbTokenExpiresAt > now) {
-    return tvdbJwtToken;
-  }
+  if (tvdbJwtToken && tvdbTokenExpiresAt > now) return tvdbJwtToken;
 
   try {
     const res = await fetch("https://api4.thetvdb.com/v4/login", {
@@ -318,10 +321,7 @@ async function getTvdbToken(apiKey) {
 
 async function tvdbGet(path, jwtToken) {
   const res = await fetch(`https://api4.thetvdb.com/v4${path}`, {
-    headers: {
-      Authorization: `Bearer ${jwtToken}`,
-      accept: "application/json"
-    }
+    headers: { Authorization: `Bearer ${jwtToken}`, accept: "application/json" }
   });
   if (!res.ok) return null;
   return await res.json();
@@ -353,17 +353,13 @@ async function fetchTvdbSpecialCut(imdbId, episodeName, season, episode, tvdbKey
           specNameNorm.includes(`s0${season}e${episode}`) ||
           specNameNorm.includes(`s${season}e${episode}`)
         ) {
-          return {
-            editionName: specName.trim(),
-            runtime: formatMinutes(spec.runtime)
-          };
+          return { editionName: specName.trim(), runtime: formatMinutes(spec.runtime) };
         }
       }
     }
   } catch (err) {
     console.warn(`[TVDB Fetch Error]: ${err.message}`);
   }
-
   return null;
 }
 
@@ -371,16 +367,8 @@ async function fetchTvdbSpecialCut(imdbId, episodeName, season, episode, tvdbKey
 
 function extractSourceMaterial(crew = []) {
   const adaptationPatterns = [
-    /novel/i,
-    /book/i,
-    /comic/i,
-    /graphic novel/i,
-    /character/i,
-    /short story/i,
-    /theatre play|play/i,
-    /video game/i,
-    /author/i,
-    /story by/i
+    /novel/i, /book/i, /comic/i, /graphic novel/i, /character/i,
+    /short story/i, /theatre play|play/i, /video game/i, /author/i, /story by/i
   ];
 
   const sources = [];
@@ -468,7 +456,7 @@ async function findByImdb(imdbId, creds) {
     const tv = (find.tv_results || [])[0];
     if (tv?.id) return { id: tv.id, type: "tv" };
   } catch {
-    // TMDB find endpoint network or 404 error
+    // Ignore find endpoint errors
   }
 
   return { id: null, type: "tv" };
@@ -520,7 +508,7 @@ async function resolveTvShow(rawId, creds) {
       const resolvedTvId = KNOWN_IMDB_TO_TMDB[rawId];
       let details = null;
       try {
-        details = await tmdbGet(`/tv/${resolvedTvId}?append_to_response=external_ids,aggregate_credits`, creds);
+        details = await tmdbGet(`/tv/${resolvedTvId}`, creds);
       } catch {
         details = { name: "Lanterns", id: resolvedTvId };
       }
@@ -531,7 +519,7 @@ async function resolveTvShow(rawId, creds) {
     if (found.id) {
       let details = null;
       try {
-        details = await tmdbGet(`/tv/${found.id}?append_to_response=external_ids,aggregate_credits`, creds);
+        details = await tmdbGet(`/tv/${found.id}`, creds);
       } catch {
         details = { id: found.id };
       }
@@ -573,7 +561,6 @@ async function getMovieInfo(rawId, creds) {
       if (specialCut) break;
     }
 
-    // Curated catalog fallback for famous extended film runtimes
     if ((!specialCut || !specialCut.runtime) && KNOWN_MOVIE_CUTS[String(movie.id)]) {
       specialCut = KNOWN_MOVIE_CUTS[String(movie.id)];
     }
@@ -590,8 +577,10 @@ async function getMovieInfo(rawId, creds) {
         sourceMaterial.unshift(wiki.basedOn);
       } else if (wiki.follows && !franchise) {
         franchise = `Sequel to ${wiki.follows}`;
+      } else if (wiki.followedBy && !franchise) {
+        franchise = `Prequel to ${wiki.followedBy}`;
       }
-      // If TMDB lacked the runtime or edition, use the Wikidata duration result
+
       if ((!specialCut || !specialCut.runtime) && wiki.specialCut) {
         specialCut = wiki.specialCut;
       }
@@ -627,6 +616,26 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
   if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
 
   const promise = (async () => {
+    // ----------------- Fast-Path Intercept for Pre-Release Titles -----------------
+    const rawClean = String(seriesRawId).replace("tmdb:", "");
+    if (rawClean === "219847" || rawClean === "tt26540674") {
+      const known = KNOWN_SERIES_CONTINUITY["219847"];
+      return {
+        type: "series",
+        tvId: "219847",
+        season: 1,
+        episode: 1,
+        title: "Lanterns (In Production)",
+        airDate: known.expectedAir,
+        runtime: null,
+        specialCut: null,
+        sourceMaterial: [known.basedOn],
+        franchise: known.franchise,
+        revivalOf: null,
+        wikiUrl: known.wikiUrl
+      };
+    }
+
     const { tvId, imdbId, showData } = await resolveTvShow(seriesRawId, creds);
 
     let epData = null;
@@ -753,10 +762,19 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
         sources.unshift(wiki.basedOn);
       } else if (wiki.follows && !franchise && !revivalOf) {
         franchise = `Continuation of ${wiki.follows}`;
+      } else if (wiki.followedBy && !franchise) {
+        franchise = `Prequel to ${wiki.followedBy}`;
       }
     }
 
-    // Title fallback heuristic for shows named "Scrubs" premiering 2024–2026
+    // Heuristic fallbacks for titles containing specific keywords
+    if (/lanterns/i.test(showTitle)) {
+      if (!franchise) franchise = "DC Universe";
+      if (!sources.some(s => /green lantern/i.test(s))) {
+        sources.unshift("Green Lantern by John Broome & Gil Kane (DC Comics)");
+      }
+    }
+
     if (!revivalOf && /^scrubs/i.test(showTitle) && showTitle.toLowerCase() !== "scrubs (2001)") {
       const releaseYear = (epData?.air_date || showData?.first_air_date || "").split("-")[0];
       if (releaseYear && parseInt(releaseYear, 10) >= 2024) {
@@ -773,13 +791,13 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       season,
       episode,
       title: episodeTitle,
-      airDate,
+      airDate: airDate || (knownMatch?.expectedAir || "Not announced"),
       runtime,
       specialCut,
       sourceMaterial: [...new Set(sources)].slice(0, 2),
       franchise,
       revivalOf,
-      wikiUrl: wiki?.wikiUrl || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`
+      wikiUrl: knownMatch?.wikiUrl || wiki?.wikiUrl || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`
     };
 
     cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
@@ -811,6 +829,10 @@ function streamMovie(info) {
     const name = info.specialCut.editionName || "Extended Cut";
     const runtime = info.specialCut.runtime ? ` [Running Time: ${info.specialCut.runtime}]` : "";
     lines.push(`✂️ ${name}${runtime}`);
+  }
+
+  if (info.revivalOf) {
+    lines.push(`🔄 ${info.revivalOf}`);
   }
 
   if (info.sourceMaterial && info.sourceMaterial.length > 0) {
@@ -960,14 +982,14 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "5.6.0",
+  version: "5.7.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "5.6.0",
+    version: "5.7.0",
     name: "Release Info",
     description: "Shows release dates, runtimes (theatrical & extended cuts), source adaptations, revivals, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
