@@ -198,15 +198,21 @@ function formatAdaptedType(rawLabel, rawType, rawDepicts) {
   return "";
 }
 
-// Comprehensive Wikipedia Lead Scraper for video games, plays, movies, TV series, and fiction
-async function fetchWikipediaLeadSource(wikiUrl) {
-  if (!wikiUrl || !wikiUrl.includes("en.wikipedia.org/wiki/")) return { source: null, revivalOrReboot: null };
-  const articleTitle = wikiUrl.split("/wiki/")[1];
+// Scrapes the lead paragraph of the English Wikipedia article
+async function fetchWikipediaLeadSource(wikiUrl, fallbackTitle = "") {
+  let articleTitle = "";
+  if (wikiUrl && wikiUrl.includes("en.wikipedia.org/wiki/")) {
+    articleTitle = wikiUrl.split("/wiki/")[1].split("#")[0].split("?")[0];
+  } else if (fallbackTitle) {
+    articleTitle = encodeURIComponent(fallbackTitle.replace(/\s+/g, "_"));
+  }
+
   if (!articleTitle || articleTitle.startsWith("Special:")) return { source: null, revivalOrReboot: null };
 
   try {
     const res = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${articleTitle}`, {
-      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" },
+      redirect: "follow"
     });
     if (!res.ok) return { source: null, revivalOrReboot: null };
     const data = await res.json();
@@ -228,15 +234,17 @@ async function fetchWikipediaLeadSource(wikiUrl) {
       revivalOrReboot = `🔄 Revival of ${revivalMatch[2].trim()}${yr}`;
     }
 
-    // 2. Video Games (e.g., "based on the 2013 video game The Last of Us developed by Naughty Dog")
-    const vgMatch = extract.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(\d{4}\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?(?:\s+(?:developed|created|published)\s+by\s+([^,.;]+))?/i);
+    // 2. Video Games (Comprehensive extraction)
+    const vgMatch = extract.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(\d{4}\s+)?(?:hit\s+|acclaimed\s+|popular\s+|role-playing\s+)?video game\s+(?:series\s+|franchise\s+)?(?:(?:titled|named)\s+)?["'“]?([^"'”.,;]+?)["'”]?\s*(?:(?:developed|created|published)\s+by\s+([^,.;]+))?(?:,|\.|\sand\s)/i);
     if (vgMatch && vgMatch[2]) {
-      const gameTitle = vgMatch[2].trim();
+      const gameTitle = vgMatch[2].replace(/\s+(developed|created|published|by).*$/i, "").trim();
       const devSuffix = vgMatch[3] ? ` (${vgMatch[3].trim()})` : "";
-      source = `🎮 Video Game: "${gameTitle}"${devSuffix}`;
+      if (!/^(the|a|an|its|this)$/i.test(gameTitle)) {
+        source = `🎮 Video Game: "${gameTitle}"${devSuffix}`;
+      }
     }
 
-    // 3. Stage Plays, Theatrical Works & Musicals (Elemeno Pea, Pussy Valley, Kanji Virrudh Kanji)
+    // 3. Stage Plays, Theatrical Works & Musicals
     if (!source) {
       const playMatch = extract.match(/(?:based on|adapted from)\s+(?:(?:his|her|their|the)\s+)?(?:[a-zA-Z\s]+)?(?:stage\s+|theatre\s+|theater\s+)?play\s+(?:titled\s+|called\s+|named\s+)?["'“]?([^"'”.,;]+(?:,\s+and\s+[^"'”.,;]+)?)["'”]?/i);
       if (playMatch && playMatch[1]) {
@@ -312,7 +320,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return null;
@@ -379,7 +387,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
@@ -483,7 +491,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, statusTag: null, wikiUrl: defaultWikiUrl };
@@ -699,10 +707,13 @@ function extractStoryArcFromText(text = "") {
   if (!text) return null;
 
   // 1. Video Games
-  const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(\d{4}\s+)?(?:hit\s+|acclaimed\s+|popular\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?(?:\s+(?:developed|created|published)\s+by\s+([^,.;]+))?/i);
+  const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(\d{4}\s+)?(?:hit\s+|acclaimed\s+|popular\s+|role-playing\s+)?video game\s+(?:series\s+|franchise\s+)?(?:(?:titled|named)\s+)?["'“]?([^"'”.,;]+?)["'”]?(?:\s+(?:developed|created|published)\s+by\s+([^,.;]+))?(?:,|\.|\sand\s)/i);
   if (vgMatch && vgMatch[2]) {
+    const gameTitle = vgMatch[2].replace(/\s+(developed|created|published|by).*$/i, "").trim();
     const devSuffix = vgMatch[3] ? ` (${vgMatch[3].trim()})` : "";
-    return `🎮 Video Game: "${vgMatch[2].trim()}"${devSuffix}`;
+    if (!/^(the|a|an|its|this)$/i.test(gameTitle)) {
+      return `🎮 Video Game: "${gameTitle}"${devSuffix}`;
+    }
   }
 
   // 2. Film Remake or Television Adaptations
@@ -935,8 +946,8 @@ async function getMovieInfo(rawId, creds) {
 
     // Inspect Wikipedia Lead for video games, stage plays, remakes, or reboots
     const hasNamedSource = sourceMaterial.some(s => s.includes('"') || s.startsWith("🎮") || s.startsWith("🎭") || s.startsWith("🎬"));
-    if ((!hasNamedSource || !statusTag) && wiki?.wikiUrl) {
-      const wikiLead = await fetchWikipediaLeadSource(wiki.wikiUrl);
+    if ((!hasNamedSource || !statusTag) && (wiki?.wikiUrl || movieTitle)) {
+      const wikiLead = await fetchWikipediaLeadSource(wiki?.wikiUrl, movieTitle);
       if (wikiLead.source && !sourceMaterial.some(s => s.toLowerCase().includes(wikiLead.source.toLowerCase()))) {
         sourceMaterial.unshift(wikiLead.source);
       }
@@ -1116,7 +1127,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
     }
 
-    // 5. Check Series overview for video games, stage plays, remakes, folklore, or books
+    // 5. Check Series overview for stage play, remake, video game, mythology, or book
     if (showData?.overview && !isGameOfThrones) {
       const seriesOverviewArc = extractStoryArcFromText(showData.overview);
       if (seriesOverviewArc && !sources.some(s => s.toLowerCase().includes(seriesOverviewArc.toLowerCase()))) {
@@ -1159,8 +1170,8 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     // Inspect Wikipedia Lead paragraph for TV series video games, stage plays, reboots, or revivals
     const hasNamedSource = sources.some(s => s.includes('"') || s.startsWith("🎮") || s.startsWith("🎭") || s.startsWith("🎬"));
-    if ((!hasNamedSource || !statusTag) && wiki?.wikiUrl) {
-      const wikiLead = await fetchWikipediaLeadSource(wiki.wikiUrl);
+    if ((!hasNamedSource || !statusTag) && (wiki?.wikiUrl || showTitle)) {
+      const wikiLead = await fetchWikipediaLeadSource(wiki?.wikiUrl, showTitle);
       if (wikiLead.source && !sources.some(s => s.toLowerCase().includes(wikiLead.source.toLowerCase()))) {
         sources.unshift(wikiLead.source);
       }
@@ -1376,14 +1387,14 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "7.1.0",
+  version: "7.2.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "7.1.0",
+    version: "7.2.0",
     name: "Release Info",
     description: "Shows release dates, runtimes (theatrical & extended cuts), omni-source adaptations (video games, stage plays, remakes, books, comics, folklore), revivals/reboots, and franchise continuity in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
