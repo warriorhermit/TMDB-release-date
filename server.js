@@ -79,6 +79,48 @@ async function tmdbGet(path, creds) {
   return data;
 }
 
+// ----------------- Wikidata Continuity Engine -----------------
+
+async function fetchWikidataContinuity(imdbId) {
+  if (!imdbId || !/^tt\d+$/i.test(imdbId)) return null;
+
+  const query = `
+    SELECT ?franchiseLabel ?basedOnLabel ?followsLabel WHERE {
+      ?item wdt:P345 "${imdbId}".
+      OPTIONAL { ?item wdt:P179 ?franchise. }
+      OPTIONAL { ?item wdt:P144 ?basedOn. }
+      OPTIONAL { ?item wdt:P155 ?follows. }
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+    } LIMIT 1
+  `;
+
+  try {
+    const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "ReleaseInfoAddon/4.6 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
+      }
+    });
+
+    if (!res.ok) return null;
+    const json = await res.json();
+    const binding = json?.results?.bindings?.[0];
+
+    const franchise = binding?.franchiseLabel?.value;
+    const basedOn = binding?.basedOnLabel?.value;
+    const follows = binding?.followsLabel?.value;
+
+    return {
+      franchise: franchise && !franchise.startsWith("Q") ? franchise : null,
+      basedOn: basedOn && !basedOn.startsWith("Q") ? basedOn : null,
+      follows: follows && !follows.startsWith("Q") ? follows : null
+    };
+  } catch (err) {
+    console.warn(`[Wikidata Continuity Error for ${imdbId}]: ${err.message}`);
+    return null;
+  }
+}
+
 // ----------------- TVDB v4 Helpers -----------------
 
 async function getTvdbToken(apiKey) {
@@ -163,21 +205,34 @@ async function fetchTvdbSpecialCut(imdbId, episodeName, season, episode, tvdbKey
 // ----------------- Parsing & Formatting -----------------
 
 function extractSourceMaterial(crew = []) {
-  const adaptationJobs = [
-    "Novel",
-    "Book",
-    "Comic Book",
-    "Graphic Novel",
-    "Characters",
-    "Short Story",
-    "Theatre Play",
-    "Video Game"
+  const adaptationPatterns = [
+    /novel/i,
+    /book/i,
+    /comic/i,
+    /graphic novel/i,
+    /character/i,
+    /short story/i,
+    /theatre play|play/i,
+    /video game/i,
+    /author/i,
+    /story by/i
   ];
 
   const sources = [];
+
   for (const person of crew) {
-    if (adaptationJobs.includes(person.job)) {
-      sources.push(`${person.job} by ${person.name}`);
+    const rawJobs = [];
+    if (person.job) rawJobs.push(person.job);
+    if (Array.isArray(person.jobs)) {
+      person.jobs.forEach(j => { if (j.job) rawJobs.push(j.job); });
+    }
+
+    for (const jobTitle of rawJobs) {
+      if (adaptationPatterns.some(pattern => pattern.test(jobTitle))) {
+        const cleanJob = jobTitle.replace(/^based\s+on\s+(the\s+)?/i, "").trim();
+        const formattedJob = cleanJob.charAt(0).toUpperCase() + cleanJob.slice(1);
+        sources.push(`${formattedJob} by ${person.name}`);
+      }
     }
   }
 
@@ -282,7 +337,7 @@ async function getMovieInfo(rawId, creds) {
   if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
 
   const promise = (async () => {
-    const { movie } = await resolveMovie(rawId, creds);
+    const { movie, imdbId } = await resolveMovie(rawId, creds);
     const countries = movie.release_dates?.results || [];
 
     const theatrical = chooseRelease(countries, 3);
@@ -305,7 +360,20 @@ async function getMovieInfo(rawId, creds) {
     }
 
     const sourceMaterial = extractSourceMaterial(movie.credits?.crew || []);
-    const franchise = movie.belongs_to_collection ? movie.belongs_to_collection.name : null;
+    let franchise = movie.belongs_to_collection ? movie.belongs_to_collection.name : null;
+
+    // Fallback/enrich via Wikidata
+    if (imdbId) {
+      const wiki = await fetchWikidataContinuity(imdbId);
+      if (wiki) {
+        if (!franchise && wiki.franchise) franchise = wiki.franchise;
+        if (wiki.basedOn && !sourceMaterial.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
+          sourceMaterial.unshift(wiki.basedOn);
+        } else if (wiki.follows && !franchise) {
+          franchise = `Sequel to ${wiki.follows}`;
+        }
+      }
+    }
 
     const value = {
       type: "movie",
@@ -395,6 +463,24 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     const sourceMaterial = extractSourceMaterial(showData?.aggregate_credits?.crew || []);
+    let franchise = null;
+
+    // Pull universe continuity from Wikidata for TV series
+    if (imdbId) {
+      const wiki = await fetchWikidataContinuity(imdbId);
+      if (wiki) {
+        if (wiki.franchise) {
+          franchise = wiki.franchise.toLowerCase().includes("franchise")
+            ? wiki.franchise
+            : `${wiki.franchise} Universe`;
+        }
+        if (wiki.basedOn && !sourceMaterial.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
+          sourceMaterial.unshift(wiki.basedOn);
+        } else if (wiki.follows && !franchise) {
+          franchise = `Continuation of ${wiki.follows}`;
+        }
+      }
+    }
 
     const value = {
       type: "series",
@@ -405,7 +491,8 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       airDate,
       runtime,
       specialCut,
-      sourceMaterial
+      sourceMaterial,
+      franchise
     };
 
     cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
@@ -447,8 +534,6 @@ function streamMovie(info) {
     lines.push(`🔗 Part of: ${info.franchise}`);
   }
 
-  lines.push(`↗️️ Click to view on TMDB`);
-
   return [
     {
       name: `Release Info`,
@@ -478,7 +563,9 @@ function streamEpisode(info) {
     lines.push(`📖 Based on: ${info.sourceMaterial.join(", ")}`);
   }
 
-  lines.push(`↗️ Click to view on TMDB`);
+  if (info.franchise) {
+    lines.push(`🔗 Part of: ${info.franchise}`);
+  }
 
   return [
     {
@@ -582,16 +669,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "4.4.0",
+  version: "4.6.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "4.4.0",
+    version: "4.6.0",
     name: "Release Info",
-    description: "Shows theatrical/digital release dates, source adaptations, and runtimes for Movies & TV series in Nuvio/Stremio.",
+    description: "Shows theatrical/digital release dates, source adaptations, universe continuity, and runtimes for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
     resources: [
       "stream",
