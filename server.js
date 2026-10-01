@@ -184,7 +184,7 @@ function formatAdaptedType(rawLabel, rawType, rawDepicts) {
     return "Folklore / Legend: ";
   }
   if (/video game|game/i.test(text)) {
-    return "Video Game: ";
+    return "🎮 Video Game: ";
   }
   if (/comic|manga|graphic novel|manhwa/i.test(text)) {
     return "Comic / Graphic Novel: ";
@@ -198,43 +198,83 @@ function formatAdaptedType(rawLabel, rawType, rawDepicts) {
   return "";
 }
 
-// Scrapes the lead paragraph of the English Wikipedia article
+// Comprehensive Wikipedia Lead Scraper for video games, plays, movies, TV series, and fiction
 async function fetchWikipediaLeadSource(wikiUrl) {
-  if (!wikiUrl || !wikiUrl.includes("en.wikipedia.org/wiki/")) return null;
+  if (!wikiUrl || !wikiUrl.includes("en.wikipedia.org/wiki/")) return { source: null, revivalOrReboot: null };
   const articleTitle = wikiUrl.split("/wiki/")[1];
-  if (!articleTitle || articleTitle.startsWith("Special:")) return null;
+  if (!articleTitle || articleTitle.startsWith("Special:")) return { source: null, revivalOrReboot: null };
 
   try {
     const res = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${articleTitle}`, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
-    if (!res.ok) return null;
+    if (!res.ok) return { source: null, revivalOrReboot: null };
     const data = await res.json();
     const extract = data.extract || "";
 
-    // 1. Stage Plays & Musicals (including full titled plays without quotes, e.g. "play Elemeno Pea", "play Pussy Valley")
-    const playMatch = extract.match(/(?:based on|adapted from)\s+(?:(?:his|her|their|the)\s+)?(?:[a-zA-Z\s]+)?(?:stage\s+|theatre\s+|theater\s+)?play\s+(?:titled\s+|called\s+|named\s+)?["'“]?([^"'”.,;]+(?:,\s+and\s+[^"'”.,;]+)?)["'”]?/i);
-    if (playMatch && playMatch[1]) {
-      const playTitle = playMatch[1].replace(/\s+(by|written by|which)\s+.*$/i, "").trim();
-      return `🎭 Stage Play: "${playTitle}"`;
+    let revivalOrReboot = null;
+    let source = null;
+
+    // 1. Detect Revival / Reboot Status
+    const rebootMatch = extract.match(/(?:reboot|remake)\s+of\s+(?:the\s+)?(\d{4}\s+)?(?:television\s+series|series|show)?\s*["'“]?([^"'”.,;]+)["'”]?/i);
+    if (rebootMatch && rebootMatch[2]) {
+      const yr = rebootMatch[1] ? ` (${rebootMatch[1].trim()})` : "";
+      revivalOrReboot = `🔁 Reboot of ${rebootMatch[2].trim()}${yr}`;
     }
 
-    // 2. Film Remake or TV Series adaptation
-    const remakeMatch = extract.match(/(?:remake of|adapted from|based on)\s+(?:the\s+)?(\d{4}\s+)?(?:film|movie|television series|series)\s+["'“]?([^"'”.,;]+)["'”]?/i);
-    if (remakeMatch && remakeMatch[2]) {
-      const yearPrefix = remakeMatch[1] ? `(${remakeMatch[1].trim()}) ` : "";
-      return `🎬 Remake: "${remakeMatch[2].trim()}" ${yearPrefix}`.trim();
+    const revivalMatch = extract.match(/(?:revival|continuation)\s+of\s+(?:the\s+)?(\d{4}\s+)?(?:television\s+series|series|show)?\s*["'“]?([^"'”.,;]+)["'”]?/i);
+    if (revivalMatch && revivalMatch[2]) {
+      const yr = revivalMatch[1] ? ` (${revivalMatch[1].trim()})` : "";
+      revivalOrReboot = `🔄 Revival of ${revivalMatch[2].trim()}${yr}`;
     }
 
-    // 3. General novel / book / memoir / comic / video game adaptation
-    const generalMatch = extract.match(/(?:based on|adapted from)\s+(?:the\s+)?([^,.;]+(?:novel|book|short story|comic|graphic novel|video game|memoir))/i);
-    if (generalMatch && generalMatch[1]) {
-      return `Based on ${generalMatch[1].trim()}`;
+    // 2. Video Games (e.g., "based on the 2013 video game The Last of Us developed by Naughty Dog")
+    const vgMatch = extract.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(\d{4}\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?(?:\s+(?:developed|created|published)\s+by\s+([^,.;]+))?/i);
+    if (vgMatch && vgMatch[2]) {
+      const gameTitle = vgMatch[2].trim();
+      const devSuffix = vgMatch[3] ? ` (${vgMatch[3].trim()})` : "";
+      source = `🎮 Video Game: "${gameTitle}"${devSuffix}`;
     }
+
+    // 3. Stage Plays, Theatrical Works & Musicals (Elemeno Pea, Pussy Valley, Kanji Virrudh Kanji)
+    if (!source) {
+      const playMatch = extract.match(/(?:based on|adapted from)\s+(?:(?:his|her|their|the)\s+)?(?:[a-zA-Z\s]+)?(?:stage\s+|theatre\s+|theater\s+)?play\s+(?:titled\s+|called\s+|named\s+)?["'“]?([^"'”.,;]+(?:,\s+and\s+[^"'”.,;]+)?)["'”]?/i);
+      if (playMatch && playMatch[1]) {
+        const playTitle = playMatch[1].replace(/\s+(by|written by|which)\s+.*$/i, "").trim();
+        source = `🎭 Stage Play: "${playTitle}"`;
+      }
+    }
+
+    // 4. Film Remakes & TV Series Adaptations
+    if (!source) {
+      const filmRemakeMatch = extract.match(/(?:remake of|adapted from|based on)\s+(?:the\s+)?(\d{4}\s+)?(?:film|movie)\s+["'“]?([^"'”.,;]+)["'”]?/i);
+      if (filmRemakeMatch && filmRemakeMatch[2]) {
+        const yearPrefix = filmRemakeMatch[1] ? `(${filmRemakeMatch[1].trim()}) ` : "";
+        source = `🎬 Remake: "${filmRemakeMatch[2].trim()}" ${yearPrefix}`.trim();
+      }
+    }
+
+    if (!source) {
+      const tvAdaptMatch = extract.match(/(?:based on|adapted from)\s+(?:the\s+)?(\d{4}\s+)?(?:television\s+series|tv\s+series|miniseries)\s+["'“]?([^"'”.,;]+)["'”]?/i);
+      if (tvAdaptMatch && tvAdaptMatch[2]) {
+        const yearPrefix = tvAdaptMatch[1] ? `(${tvAdaptMatch[1].trim()}) ` : "";
+        source = `📺 Adapted from TV Series: "${tvAdaptMatch[2].trim()}" ${yearPrefix}`.trim();
+      }
+    }
+
+    // 5. Novels, Comics, Graphic Novels, Short Stories
+    if (!source) {
+      const litMatch = extract.match(/(?:based on|adapted from)\s+(?:the\s+)?(?:(\d{4})\s+)?([^,.;]+?\s+(?:novel|book|comic|graphic novel|manga|short story|memoir))(?:\s+by\s+([^,.;]+))?/i);
+      if (litMatch && litMatch[2]) {
+        const author = litMatch[3] ? ` by ${litMatch[3].trim()}` : "";
+        source = `Based on ${litMatch[2].trim()}${author}`;
+      }
+    }
+
+    return { source, revivalOrReboot };
   } catch {
-    // Fall through cleanly
+    return { source: null, revivalOrReboot: null };
   }
-  return null;
 }
 
 // ----------------- Wikidata Engines -----------------
@@ -272,7 +312,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return null;
@@ -339,7 +379,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
@@ -405,7 +445,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
     : "https://en.wikipedia.org/";
 
   if (!imdbId || !/^tt\d+$/i.test(imdbId)) {
-    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, statusTag: null, wikiUrl: defaultWikiUrl };
   }
 
   const query = `
@@ -428,7 +468,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
       OPTIONAL {
         { ?item wdt:P155 ?predecessor. } UNION { ?item wdt:P1366 ?predecessor. }
         ?predecessor wdt:P31 ?predType .
-        FILTER(?predType IN (wd:Q5398426, wd:Q15632733))
+        FILTER(?predType IN (wd:Q5398426, wd:Q15632733, wd:Q2884170))
         OPTIONAL { ?predecessor (wdt:P580|wdt:P577) ?origStart. }
         OPTIONAL { ?predecessor wdt:P582 ?origEnd. }
       }
@@ -443,10 +483,10 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/7.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
-    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, statusTag: null, wikiUrl: defaultWikiUrl };
     const json = await res.json();
     const binding = json?.results?.bindings?.[0];
 
@@ -475,18 +515,23 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
       basedOn = null;
     }
 
-    let revivalOf = null;
+    let statusTag = null;
     const predTitle = binding?.predecessorLabel?.value;
     const startY = binding?.origStartY?.value ? parseInt(binding.origStartY.value, 10) : null;
     const endY = binding?.origEndY?.value ? parseInt(binding.origEndY.value, 10) : null;
     const currentYear = currentAirYear ? parseInt(currentAirYear, 10) : null;
 
-    const isExplicitRevival = instanceType.includes("Q2884170") || instanceType.includes("Q15632733");
+    const isExplicitRevival = instanceType.includes("Q2884170");
+    const isExplicitReboot = instanceType.includes("Q15632733") || instanceType.includes("Q46970");
     const hasLongHiatus = endY && currentYear && (currentYear - endY >= 5);
 
-    if (predTitle && !predTitle.startsWith("Q") && (isExplicitRevival || hasLongHiatus)) {
+    if (predTitle && !predTitle.startsWith("Q")) {
       const yearRange = startY && endY ? ` (${startY}–${endY})` : (startY ? ` (${startY})` : "");
-      revivalOf = `Revival of ${predTitle}${yearRange}`;
+      if (isExplicitReboot) {
+        statusTag = `🔁 Reboot of ${predTitle}${yearRange}`;
+      } else if (isExplicitRevival || hasLongHiatus) {
+        statusTag = `🔄 Revival of ${predTitle}${yearRange}`;
+      }
     }
 
     return {
@@ -494,12 +539,12 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
       basedOn,
       follows: follows && !follows.startsWith("Q") ? follows : null,
       followedBy: followedBy && !followedBy.startsWith("Q") ? followedBy : null,
-      revivalOf,
+      statusTag,
       wikiUrl
     };
   } catch (err) {
     console.warn(`[Wikidata Details Error for ${imdbId}]: ${err.message}`);
-    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, statusTag: null, wikiUrl: defaultWikiUrl };
   }
 }
 
@@ -633,6 +678,8 @@ function extractSourceMaterial(crew = []) {
           cleanJob = "🎭 Stage Play";
         } else if (/musical/i.test(cleanJob)) {
           cleanJob = "🎭 Musical";
+        } else if (/video game/i.test(cleanJob)) {
+          cleanJob = "🎮 Video Game";
         } else if (/comic/i.test(cleanJob)) {
           cleanJob = "Comic / Graphic Novel";
         } else if (/novel|book/i.test(cleanJob)) {
@@ -651,37 +698,38 @@ function extractSourceMaterial(crew = []) {
 function extractStoryArcFromText(text = "") {
   if (!text) return null;
 
-  // 1. Film Remake or Television Adaptations
+  // 1. Video Games
+  const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(\d{4}\s+)?(?:hit\s+|acclaimed\s+|popular\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?(?:\s+(?:developed|created|published)\s+by\s+([^,.;]+))?/i);
+  if (vgMatch && vgMatch[2]) {
+    const devSuffix = vgMatch[3] ? ` (${vgMatch[3].trim()})` : "";
+    return `🎮 Video Game: "${vgMatch[2].trim()}"${devSuffix}`;
+  }
+
+  // 2. Film Remake or Television Adaptations
   const filmRemakeMatch = text.match(/(?:remake of|adapted from|based on)\s+(?:the\s+)?(\d{4}\s+)?(?:film|movie|television series)\s+["'“]?([^"'”.,;]+)["'”]?/i);
   if (filmRemakeMatch && filmRemakeMatch[2]) {
     const yearPrefix = filmRemakeMatch[1] ? `(${filmRemakeMatch[1].trim()}) ` : "";
     return `🎬 Remake: "${filmRemakeMatch[2].trim()}" ${yearPrefix}`.trim();
   }
 
-  // 2. Stage Plays, Theatrical Works, and Musicals
+  // 3. Stage Plays, Theatrical Works, and Musicals
   const playMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:stage\s+|theatre\s+|theater\s+|broadway\s+)?(play|musical|opera|theatrical production)\s+(?:of\s+|titled\s+|by\s+|named\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
   if (playMatch && playMatch[2]) {
     const playType = /musical/i.test(playMatch[1]) ? "Musical" : (/opera/i.test(playMatch[1]) ? "Opera" : "Stage Play");
     return `🎭 ${playType}: "${playMatch[2].trim()}"`;
   }
 
-  // 3. Direct Play titles mentioned in prose
+  // 4. Direct Play titles mentioned in prose
   const directPlayNameMatch = text.match(/(?:her|his|their|the)\s+(?:acclaimed\s+|comedy\s+|dramatic\s+)?play\s+["'“]?([^"'”.,;]+)["'”]?/i);
   if (directPlayNameMatch && directPlayNameMatch[1]) {
     return `🎭 Stage Play: "${directPlayNameMatch[1].trim()}"`;
   }
 
-  // 4. Folklore, Fairy Tales, or Mythology
+  // 5. Folklore, Fairy Tales, or Mythology
   const mythMatch = text.match(/(?:based on|inspired by|adapts|adapting)\s+(?:the\s+)?([a-zA-Z\s]+(?:mythology|myth|folklore|legend|fairy tale|fable))(?:\s+of\s+["'“]?([^"'”.,;]+)["'”]?)?/i);
   if (mythMatch && mythMatch[1]) {
     const specificDetail = mythMatch[2] ? ` (${mythMatch[2].trim()})` : "";
     return `Mythology/Folklore: ${mythMatch[1].trim()}${specificDetail}`;
-  }
-
-  // 5. Video Games
-  const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:hit\s+|acclaimed\s+|popular\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
-  if (vgMatch && vgMatch[1]) {
-    return `Video Game: ${vgMatch[1].trim()}`;
   }
 
   // 6. Books, Novels, Comic arcs
@@ -859,7 +907,7 @@ async function getMovieInfo(rawId, creds) {
     const sourceMaterial = extractSourceMaterial(movie.credits?.crew || []);
     let franchise = movie.belongs_to_collection ? movie.belongs_to_collection.name : null;
 
-    // Detect plays, remakes, fiction, mythology, folklore or game arcs from movie overview
+    // Detect plays, remakes, video games, fiction, mythology, folklore from movie overview
     const overviewArc = extractStoryArcFromText(movie.overview);
     if (overviewArc && !sourceMaterial.some(s => s.toLowerCase().includes(overviewArc.toLowerCase()))) {
       sourceMaterial.unshift(overviewArc);
@@ -867,6 +915,8 @@ async function getMovieInfo(rawId, creds) {
 
     const movieTitle = movie.title || movie.original_title || "";
     const wiki = await fetchWikidataMovieDetails(imdbId, movieTitle, movie.runtime);
+
+    let statusTag = null;
 
     if (wiki) {
       if (!franchise && wiki.franchise) franchise = wiki.franchise;
@@ -883,12 +933,15 @@ async function getMovieInfo(rawId, creds) {
       }
     }
 
-    // Inspect Wikipedia Lead if no explicit titled adaptation was found
-    const hasNamedSource = sourceMaterial.some(s => s.includes('"') || s.startsWith("🎭") || s.startsWith("🎬"));
-    if (!hasNamedSource && wiki?.wikiUrl) {
-      const wikiLeadSource = await fetchWikipediaLeadSource(wiki.wikiUrl);
-      if (wikiLeadSource && !sourceMaterial.some(s => s.toLowerCase().includes(wikiLeadSource.toLowerCase()))) {
-        sourceMaterial.unshift(wikiLeadSource);
+    // Inspect Wikipedia Lead for video games, stage plays, remakes, or reboots
+    const hasNamedSource = sourceMaterial.some(s => s.includes('"') || s.startsWith("🎮") || s.startsWith("🎭") || s.startsWith("🎬"));
+    if ((!hasNamedSource || !statusTag) && wiki?.wikiUrl) {
+      const wikiLead = await fetchWikipediaLeadSource(wiki.wikiUrl);
+      if (wikiLead.source && !sourceMaterial.some(s => s.toLowerCase().includes(wikiLead.source.toLowerCase()))) {
+        sourceMaterial.unshift(wikiLead.source);
+      }
+      if (wikiLead.revivalOrReboot) {
+        statusTag = wikiLead.revivalOrReboot;
       }
     }
 
@@ -903,6 +956,7 @@ async function getMovieInfo(rawId, creds) {
       specialCut,
       sourceMaterial,
       franchise,
+      statusTag,
       wikiUrl: wiki.wikiUrl
     };
 
@@ -937,7 +991,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
         specialCut: null,
         sourceMaterial: [known.basedOn],
         franchise: known.franchise,
-        revivalOf: null,
+        statusTag: null,
         wikiUrl: known.wikiUrl
       };
     }
@@ -1062,7 +1116,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
     }
 
-    // 5. Check Series overview for stage play, remake, mythology, folklore, or book mentions
+    // 5. Check Series overview for video games, stage plays, remakes, folklore, or books
     if (showData?.overview && !isGameOfThrones) {
       const seriesOverviewArc = extractStoryArcFromText(showData.overview);
       if (seriesOverviewArc && !sources.some(s => s.toLowerCase().includes(seriesOverviewArc.toLowerCase()))) {
@@ -1081,7 +1135,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     let franchise = knownMatch?.franchise || (isGameOfThrones ? "A Song of Ice and Fire Universe" : null);
-    let revivalOf = knownMatch?.revivalOf || null;
+    let statusTag = null;
 
     const wiki = await fetchWikidataDetails(imdbId, showTitle, airYear);
 
@@ -1091,24 +1145,27 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
           ? wiki.franchise
           : `${wiki.franchise} Universe`;
       }
-      if (!revivalOf && wiki.revivalOf) {
-        revivalOf = wiki.revivalOf;
+      if (wiki.statusTag) {
+        statusTag = wiki.statusTag;
       }
       if (!isGameOfThrones && wiki.basedOn && !sources.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sources.unshift(wiki.basedOn);
-      } else if (wiki.follows && !franchise && !revivalOf) {
+      } else if (wiki.follows && !franchise && !statusTag) {
         franchise = `Continuation of ${wiki.follows}`;
       } else if (wiki.followedBy && !franchise) {
         franchise = `Prequel to ${wiki.followedBy}`;
       }
     }
 
-    // Inspect Wikipedia Lead paragraph for TV series if no titled stage play or remake is identified
-    const hasNamedSource = sources.some(s => s.includes('"') || s.startsWith("🎭") || s.startsWith("🎬"));
-    if (!hasNamedSource && wiki?.wikiUrl) {
-      const wikiLeadSource = await fetchWikipediaLeadSource(wiki.wikiUrl);
-      if (wikiLeadSource && !sources.some(s => s.toLowerCase().includes(wikiLeadSource.toLowerCase()))) {
-        sources.unshift(wikiLeadSource);
+    // Inspect Wikipedia Lead paragraph for TV series video games, stage plays, reboots, or revivals
+    const hasNamedSource = sources.some(s => s.includes('"') || s.startsWith("🎮") || s.startsWith("🎭") || s.startsWith("🎬"));
+    if ((!hasNamedSource || !statusTag) && wiki?.wikiUrl) {
+      const wikiLead = await fetchWikipediaLeadSource(wiki.wikiUrl);
+      if (wikiLead.source && !sources.some(s => s.toLowerCase().includes(wikiLead.source.toLowerCase()))) {
+        sources.unshift(wikiLead.source);
+      }
+      if (!statusTag && wikiLead.revivalOrReboot) {
+        statusTag = wikiLead.revivalOrReboot;
       }
     }
 
@@ -1133,7 +1190,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       specialCut,
       sourceMaterial: [...new Set(sources)].slice(0, 2),
       franchise,
-      revivalOf,
+      statusTag,
       wikiUrl: finalWikiUrl
     };
 
@@ -1168,8 +1225,8 @@ function streamMovie(info) {
     lines.push(`✂️ ${name}${runtime}`);
   }
 
-  if (info.revivalOf) {
-    lines.push(`🔄 ${info.revivalOf}`);
+  if (info.statusTag) {
+    lines.push(info.statusTag);
   }
 
   if (info.sourceMaterial && info.sourceMaterial.length > 0) {
@@ -1205,8 +1262,8 @@ function streamEpisode(info) {
     lines.push(`✂️ ${name}${runtime}`);
   }
 
-  if (info.revivalOf) {
-    lines.push(`🔄 ${info.revivalOf}`);
+  if (info.statusTag) {
+    lines.push(info.statusTag);
   }
 
   if (info.sourceMaterial && info.sourceMaterial.length > 0) {
@@ -1265,7 +1322,7 @@ app.get("/", (_req, res) => {
           <img src="https://thetvdb.com/images/logo.png" alt="TheTVDB Logo" title="TheTVDB" style="filter: brightness(0) invert(1);" />
         </div>
 
-        <p>Displays release dates, runtimes (theatrical & extended cuts), adaptations (film remakes, stage plays, books, comics, video games, folklore, mythology, fiction), validated revivals, and continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
+        <p>Displays theatrical & digital release dates, runtimes (theatrical & extended cuts), source adaptations (video games, stage plays, remakes, books, comics, folklore), revivals/reboots, and franchise continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
@@ -1319,16 +1376,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "6.8.0",
+  version: "7.1.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.8.0",
+    version: "7.1.0",
     name: "Release Info",
-    description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (film remakes, stage plays, books, comics, video games, mythology, folklore), validated revivals, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
+    description: "Shows release dates, runtimes (theatrical & extended cuts), omni-source adaptations (video games, stage plays, remakes, books, comics, folklore), revivals/reboots, and franchise continuity in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
     resources: [
       "stream",
