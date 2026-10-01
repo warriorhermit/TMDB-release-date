@@ -57,7 +57,7 @@ const GOT_SEASON_BOOKS = {
   8: 'Outlines for "A Dream of Spring" by George R. R. Martin'
 };
 
-// Curated backup for notable adaptations / continuity / folklore / mythology
+// Curated backup for notable pre-release titles / franchise continuity
 const KNOWN_SERIES_CONTINUITY = {
   // Game of Thrones
   "1399": {
@@ -67,48 +67,6 @@ const KNOWN_SERIES_CONTINUITY = {
   "tt0944947": {
     franchise: "A Song of Ice and Fire Universe",
     wikiUrl: "https://en.wikipedia.org/wiki/Game_of_Thrones"
-  },
-
-  // Video Game Adaptations
-  "100088": {
-    franchise: "The Last of Us Universe",
-    basedOn: "Video Game: The Last of Us (Naughty Dog / PlayStation)",
-    wikiUrl: "https://en.wikipedia.org/wiki/The_Last_of_Us_(TV_series)"
-  },
-  "tt3581920": {
-    franchise: "The Last of Us Universe",
-    basedOn: "Video Game: The Last of Us (Naughty Dog / PlayStation)",
-    wikiUrl: "https://en.wikipedia.org/wiki/The_Last_of_Us_(TV_series)"
-  },
-  "106379": {
-    franchise: "Fallout Universe",
-    basedOn: "Video Game: Fallout (Bethesda / Interplay)",
-    wikiUrl: "https://en.wikipedia.org/wiki/Fallout_(American_TV_series)"
-  },
-  "tt12637874": {
-    franchise: "Fallout Universe",
-    basedOn: "Video Game: Fallout (Bethesda / Interplay)",
-    wikiUrl: "https://en.wikipedia.org/wiki/Fallout_(American_TV_series)"
-  },
-  "94605": { // Arcane
-    franchise: "League of Legends Universe",
-    basedOn: "Video Game: League of Legends (Riot Games)",
-    wikiUrl: "https://en.wikipedia.org/wiki/Arcane_(TV_series)"
-  },
-  "tt11126994": {
-    franchise: "League of Legends Universe",
-    basedOn: "Video Game: League of Legends (Riot Games)",
-    wikiUrl: "https://en.wikipedia.org/wiki/Arcane_(TV_series)"
-  },
-  "71024": { // Castlevania
-    franchise: "Castlevania Universe",
-    basedOn: "Video Game: Castlevania (Konami)",
-    wikiUrl: "https://en.wikipedia.org/wiki/Castlevania_(TV_series)"
-  },
-  "tt6517102": {
-    franchise: "Castlevania Universe",
-    basedOn: "Video Game: Castlevania (Konami)",
-    wikiUrl: "https://en.wikipedia.org/wiki/Castlevania_(TV_series)"
   },
 
   // Lanterns (HBO / DC Studios)
@@ -198,10 +156,18 @@ async function tmdbGet(path, creds) {
   return data;
 }
 
-// ----------------- Fiction / Stage Play / Folklore Classification Helper -----------------
+// ----------------- Classification Helpers -----------------
 
 function formatAdaptedType(rawLabel, rawType, rawDepicts) {
   const text = `${rawLabel} ${rawType} ${rawDepicts}`.toLowerCase();
+
+  // Remake / Film / TV Adaptation
+  if (/remake|film|movie|feature film/i.test(text)) {
+    return "🎬 Remake / Film: ";
+  }
+  if (/television series|tv series|television show/i.test(text)) {
+    return "📺 Adapted from TV Series: ";
+  }
 
   // Stage Plays, Musicals, and Operas
   if (/broadway musical|musical play|musical theatre|stage musical/i.test(text)) {
@@ -222,7 +188,7 @@ function formatAdaptedType(rawLabel, rawType, rawDepicts) {
     return "Folklore / Legend: ";
   }
 
-  // Other Forms of Fiction
+  // Fiction Media
   if (/video game|game/i.test(text)) {
     return "Video Game: ";
   }
@@ -236,6 +202,51 @@ function formatAdaptedType(rawLabel, rawType, rawDepicts) {
     return "Novel: ";
   }
   return "";
+}
+
+// Scrapes the lead paragraph of the English Wikipedia article for plays, remakes, and literary sources
+async function fetchWikipediaLeadSource(wikiUrl) {
+  if (!wikiUrl || !wikiUrl.includes("en.wikipedia.org/wiki/")) return null;
+  const articleTitle = wikiUrl.split("/wiki/")[1];
+  if (!articleTitle || articleTitle.startsWith("Special:")) return null;
+
+  try {
+    const res = await fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${articleTitle}`, {
+      headers: { "User-Agent": "ReleaseInfoAddon/6.7" }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const extract = data.extract || "";
+
+    // 1. Check for Film Remake or Television Adaptations
+    const remakeMatch = extract.match(/(?:remake of|adapted from|based on)\s+(?:the\s+)?(\d{4}\s+)?(?:film|movie|television series|series)\s+["'“]?([^"'”.,;]+)["'”]?/i);
+    if (remakeMatch && remakeMatch[2]) {
+      const yearPrefix = remakeMatch[1] ? `(${remakeMatch[1].trim()}) ` : "";
+      return `🎬 Remake: "${remakeMatch[2].trim()}" ${yearPrefix}`.trim();
+    }
+
+    // 2. Check for Stage Play mentions (handles Gujarati/Hindi/Broadway/regional theatre)
+    const playMatch = extract.match(/(?:based on|adapted from)\s+(?:the\s+)?([a-zA-Z\s]+)?(?:play|stage play|theatre play|musical)\s+["'“]?([^"'”.,;]+)["'”]?/i);
+    if (playMatch && playMatch[2]) {
+      const languageOrType = playMatch[1] ? `${playMatch[1].trim()} ` : "";
+      return `🎭 Stage Play: "${playMatch[2].trim()}" (${languageOrType}Play)`.trim();
+    }
+
+    // 3. Check for specific named play (e.g. "his play Kanji Virrudh Kanji", "her play Elemeno Pea")
+    const authorPlayMatch = extract.match(/(?:his|her|their)\s+(?:stage\s+)?play\s+["'“]?([^"'”.,;]+)["'”]?/i);
+    if (authorPlayMatch && authorPlayMatch[1]) {
+      return `🎭 Stage Play: "${authorPlayMatch[1].trim()}"`;
+    }
+
+    // 4. Check for general Literary or Novel Adaptation
+    const generalMatch = extract.match(/(?:based on|adapted from)\s+(?:the\s+)?([^,.;]+(?:novel|book|short story|comic|graphic novel|video game|memoir))/i);
+    if (generalMatch && generalMatch[1]) {
+      return `Based on ${generalMatch[1].trim()}`;
+    }
+  } catch (err) {
+    // Non-blocking Wikipedia API failure
+  }
+  return null;
 }
 
 // ----------------- Wikidata Engines -----------------
@@ -258,7 +269,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   const query = `
     SELECT ?workLabel ?creatorLabel ?workTypeLabel ?depictsLabel ?article WHERE {
       ${subjectPattern}
-      { ?ep wdt:P144 ?work . } UNION { ?ep wdt:P921 ?work . } UNION { ?ep wdt:P180 ?work . }
+      { ?ep wdt:P144 ?work . } UNION { ?ep wdt:P921 ?work . } UNION { ?ep wdt:P180 ?work . } UNION { ?ep wdt:P1877 ?work . }
       OPTIONAL { ?work wdt:P31 ?workType . }
       OPTIONAL { ?work wdt:P180 ?depicts . }
       OPTIONAL { { ?work wdt:P50 ?creator . } UNION { ?work wdt:P178 ?creator . } UNION { ?work wdt:P123 ?creator . } }
@@ -273,7 +284,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return null;
@@ -315,7 +326,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
       ?item wdt:P345 "${imdbId}".
       OPTIONAL { ?item wdt:P179 ?franchise. }
       OPTIONAL {
-        { ?item wdt:P144 ?basedOnItem . } UNION { ?item wdt:P921 ?basedOnItem . } UNION { ?item wdt:P180 ?basedOnItem . }
+        { ?item wdt:P144 ?basedOnItem . } UNION { ?item wdt:P921 ?basedOnItem . } UNION { ?item wdt:P180 ?basedOnItem . } UNION { ?item wdt:P1877 ?basedOnItem . } UNION { ?item wdt:P737 ?basedOnItem . }
         ?basedOnItem rdfs:label ?basedOnLabel filter (lang(?basedOnLabel) = "en") .
         OPTIONAL { ?basedOnItem wdt:P31 ?basedOnType . }
         OPTIONAL { ?basedOnItem wdt:P180 ?depicts . }
@@ -340,7 +351,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
@@ -416,7 +427,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
       OPTIONAL { ?item wdt:P179 ?franchise. }
       OPTIONAL { ?item wdt:P31 ?instanceType. }
       OPTIONAL {
-        { ?item wdt:P144 ?basedOnItem . } UNION { ?item wdt:P921 ?basedOnItem . } UNION { ?item wdt:P180 ?basedOnItem . }
+        { ?item wdt:P144 ?basedOnItem . } UNION { ?item wdt:P921 ?basedOnItem . } UNION { ?item wdt:P180 ?basedOnItem . } UNION { ?item wdt:P1877 ?basedOnItem . } UNION { ?item wdt:P737 ?basedOnItem . }
         ?basedOnItem rdfs:label ?basedOnLabel filter (lang(?basedOnLabel) = "en") .
         OPTIONAL { ?basedOnItem wdt:P31 ?basedOnType . }
         OPTIONAL { ?basedOnItem wdt:P180 ?depicts . }
@@ -444,7 +455,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "", currentAirYear =
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
@@ -583,7 +594,7 @@ function extractSourceMaterial(crew = []) {
     /novel/i, /book/i, /comic/i, /graphic novel/i, /character/i,
     /short story/i, /theatre play|theater play|stage play|\bplay\b/i,
     /musical/i, /opera|libretto/i, /video game|game/i, /mythology|myth/i,
-    /folklore|legend/i, /fairy tale/i, /playwright/i, /author/i, /story by/i
+    /folklore|legend/i, /fairy tale/i, /remake|earlier film/i, /playwright/i, /author/i, /story by/i
   ];
 
   const sources = [];
@@ -615,28 +626,41 @@ function extractSourceMaterial(crew = []) {
 function extractStoryArcFromText(text = "") {
   if (!text) return null;
 
-  // 1. Stage Plays, Theatrical Works, and Musicals
-  const playMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:stage\s+|theatre\s+|theater\s+|broadway\s+)?(play|musical|opera|theatrical production)\s+(?:of\s+|titled\s+|by\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
+  // 1. Film Remake or Television Adaptations
+  const filmRemakeMatch = text.match(/(?:remake of|adapted from|based on)\s+(?:the\s+)?(\d{4}\s+)?(?:film|movie|television series)\s+["'“]?([^"'”.,;]+)["'”]?/i);
+  if (filmRemakeMatch && filmRemakeMatch[2]) {
+    const yearPrefix = filmRemakeMatch[1] ? `(${filmRemakeMatch[1].trim()}) ` : "";
+    return `🎬 Remake: "${filmRemakeMatch[2].trim()}" ${yearPrefix}`.trim();
+  }
+
+  // 2. Stage Plays, Theatrical Works, and Musicals (including named titles)
+  const playMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:stage\s+|theatre\s+|theater\s+|broadway\s+)?(play|musical|opera|theatrical production)\s+(?:of\s+|titled\s+|by\s+|named\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
   if (playMatch && playMatch[2]) {
     const playType = /musical/i.test(playMatch[1]) ? "Musical" : (/opera/i.test(playMatch[1]) ? "Opera" : "Stage Play");
     return `🎭 ${playType}: "${playMatch[2].trim()}"`;
   }
 
-  // 2. Folklore, Fairy Tales, or Mythology
+  // 3. Specific Play titles mentioned directly in prose (e.g. "play Elemeno Pea", "play Kanji Virrudh Kanji")
+  const directPlayNameMatch = text.match(/(?:her|his|their|the)\s+(?:acclaimed\s+|comedy\s+|dramatic\s+)?play\s+["'“]?([^"'”.,;]+)["'”]?/i);
+  if (directPlayNameMatch && directPlayNameMatch[1]) {
+    return `🎭 Stage Play: "${directPlayNameMatch[1].trim()}"`;
+  }
+
+  // 4. Folklore, Fairy Tales, or Mythology
   const mythMatch = text.match(/(?:based on|inspired by|adapts|adapting)\s+(?:the\s+)?([a-zA-Z\s]+(?:mythology|myth|folklore|legend|fairy tale|fable))(?:\s+of\s+["'“]?([^"'”.,;]+)["'”]?)?/i);
   if (mythMatch && mythMatch[1]) {
     const specificDetail = mythMatch[2] ? ` (${mythMatch[2].trim()})` : "";
     return `Mythology/Folklore: ${mythMatch[1].trim()}${specificDetail}`;
   }
 
-  // 3. Video Games
+  // 5. Video Games
   const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:hit\s+|acclaimed\s+|popular\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
   if (vgMatch && vgMatch[1]) {
     return `Video Game: ${vgMatch[1].trim()}`;
   }
 
-  // 4. Books, Novels, Comic arcs
-  const arcMatch = text.match(/(?:based on|adapted from|adapting)\s+(?:the\s+(?:book|novel|comic|short story|play)\s+)?["'“]([^"'”]+)["'”]/i);
+  // 6. Books, Novels, Comic arcs
+  const arcMatch = text.match(/(?:based on|adapted from|adapting)\s+(?:the\s+(?:book|novel|comic|short story)\s+)?["'“]([^"'”]+)["'”]/i);
   return arcMatch && arcMatch[1] ? arcMatch[1].trim() : null;
 }
 
@@ -810,7 +834,7 @@ async function getMovieInfo(rawId, creds) {
     const sourceMaterial = extractSourceMaterial(movie.credits?.crew || []);
     let franchise = movie.belongs_to_collection ? movie.belongs_to_collection.name : null;
 
-    // Detect plays, fiction, mythology, folklore or game arcs from movie overview
+    // Detect plays, remakes, fiction, mythology, folklore or game arcs from movie overview
     const overviewArc = extractStoryArcFromText(movie.overview);
     if (overviewArc && !sourceMaterial.some(s => s.toLowerCase().includes(overviewArc.toLowerCase()))) {
       sourceMaterial.unshift(overviewArc);
@@ -831,6 +855,14 @@ async function getMovieInfo(rawId, creds) {
 
       if ((!specialCut || !specialCut.runtime) && wiki.specialCut) {
         specialCut = wiki.specialCut;
+      }
+    }
+
+    // Inspect Wikipedia Lead if neither TMDB nor Wikidata yielded source material
+    if (sourceMaterial.length === 0 && wiki?.wikiUrl) {
+      const wikiLeadSource = await fetchWikipediaLeadSource(wiki.wikiUrl);
+      if (wikiLeadSource) {
+        sourceMaterial.push(wikiLeadSource);
       }
     }
 
@@ -966,7 +998,9 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     // 1. Check curated catalog
-    const knownMatch = (tvId ? KNOWN_SERIES_CONTINUITY[String(tvId)] : null) || (imdbId ? KNOWN_SERIES_CONTINUITY[imdbId] : null);
+    const showTitle = showData?.name || showData?.original_name || "";
+    let knownMatch = (tvId ? KNOWN_SERIES_CONTINUITY[String(tvId)] : null) || (imdbId ? KNOWN_SERIES_CONTINUITY[imdbId] : null);
+
     if (!isGameOfThrones && knownMatch?.basedOn) {
       sources.push(knownMatch.basedOn);
     }
@@ -978,7 +1012,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (epWikiData.episodeWikiUrl) episodeWikiUrl = epWikiData.episodeWikiUrl;
     }
 
-    // 3. Check Episode credits & synopsis for specific play/novel/comic/game arc
+    // 3. Check Episode credits & synopsis for specific play/novel/comic/game/remake arc
     if (epData && !isGameOfThrones) {
       const epArc = extractStoryArcFromText(epData.overview);
       if (epArc && !sources.some(s => s.toLowerCase().includes(epArc.toLowerCase()))) {
@@ -990,7 +1024,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
     }
 
-    // 4. Check Season synopsis & credits (for shows other than GoT, e.g. Reacher, Percy Jackson)
+    // 4. Check Season synopsis & credits
     if (seasonData && !isGameOfThrones) {
       const seasonArc = extractStoryArcFromText(seasonData.overview);
       if (seasonArc && !sources.some(s => s.toLowerCase().includes(seasonArc.toLowerCase()))) {
@@ -1002,7 +1036,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
     }
 
-    // 5. Check Series overview for stage play, mythology, folklore, or book mentions
+    // 5. Check Series overview for stage play, remake, mythology, folklore, or book mentions
     if (showData?.overview && !isGameOfThrones) {
       const seriesOverviewArc = extractStoryArcFromText(showData.overview);
       if (seriesOverviewArc && !sources.some(s => s.toLowerCase().includes(seriesOverviewArc.toLowerCase()))) {
@@ -1023,7 +1057,6 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     let franchise = knownMatch?.franchise || (isGameOfThrones ? "A Song of Ice and Fire Universe" : null);
     let revivalOf = knownMatch?.revivalOf || null;
 
-    const showTitle = showData?.name || showData?.original_name || "";
     const wiki = await fetchWikidataDetails(imdbId, showTitle, airYear);
 
     if (wiki) {
@@ -1041,6 +1074,14 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
         franchise = `Continuation of ${wiki.follows}`;
       } else if (wiki.followedBy && !franchise) {
         franchise = `Prequel to ${wiki.followedBy}`;
+      }
+    }
+
+    // Inspect Wikipedia Lead paragraph for TV series stage play/remake mentions
+    if (sources.length === 0 && wiki?.wikiUrl) {
+      const wikiLeadSource = await fetchWikipediaLeadSource(wiki.wikiUrl);
+      if (wikiLeadSource) {
+        sources.push(wikiLeadSource);
       }
     }
 
@@ -1197,7 +1238,7 @@ app.get("/", (_req, res) => {
           <img src="https://thetvdb.com/images/logo.png" alt="TheTVDB Logo" title="TheTVDB" style="filter: brightness(0) invert(1);" />
         </div>
 
-        <p>Displays release dates, runtimes (theatrical & extended cuts), adaptations (stage plays, books, comics, video games, folklore, mythology, fiction), validated revivals, and continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
+        <p>Displays release dates, runtimes (theatrical & extended cuts), adaptations (film remakes, stage plays, books, comics, video games, folklore, mythology, fiction), validated revivals, and continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
@@ -1251,16 +1292,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "6.4.0",
+  version: "6.7.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.4.0",
+    version: "6.7.0",
     name: "Release Info",
-    description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (stage plays, books, comics, video games, mythology, folklore), validated revivals, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
+    description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (film remakes, stage plays, books, comics, video games, mythology, folklore), validated revivals, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
     resources: [
       "stream",
