@@ -20,11 +20,16 @@ const KNOWN_TV_CUTS = {
   "1972:4:20": { editionName: "Extended Finale", runtime: "2h 32m" } // Daybreak
 };
 
-// Curated backup for notable adaptations / comic lines
+// Curated backup for notable adaptations / comic lines / unreleased continuity
 const KNOWN_SERIES_CONTINUITY = {
-  "219847": { // Lanterns
+  // Lanterns (HBO / DC Studios)
+  "219847": {
     franchise: "DC Universe",
-    basedOn: "Green Lantern (DC Comics)"
+    basedOn: "Green Lantern by John Broome & Gil Kane (DC Comics)"
+  },
+  "tt26540674": {
+    franchise: "DC Universe",
+    basedOn: "Green Lantern by John Broome & Gil Kane (DC Comics)"
   }
 };
 
@@ -116,7 +121,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
       headers: {
-        "User-Agent": "ReleaseInfoAddon/5.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
+        "User-Agent": "ReleaseInfoAddon/5.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)"
       }
     });
 
@@ -433,77 +438,79 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
   const promise = (async () => {
     const { tvId, imdbId, showData } = await resolveTvShow(seriesRawId, creds);
 
-    const epData = await tmdbGet(`/tv/${tvId}/season/${season}/episode/${episode}?append_to_response=credits`, creds);
+    // Gracefully handle unreleased episodes (e.g. Lanterns) where episode endpoint 404s
+    let epData = null;
+    try {
+      epData = await tmdbGet(`/tv/${tvId}/season/${season}/episode/${episode}?append_to_response=credits`, creds);
+    } catch {
+      // Episode not created/indexed yet
+    }
 
     let seasonData = null;
     try {
       seasonData = await tmdbGet(`/tv/${tvId}/season/${season}?append_to_response=credits`, creds);
     } catch {
-      // Ignore if unavailable
+      // Season not indexed yet
     }
 
-    const airDate = parseDate(epData.air_date);
-    const runtime = formatMinutes(epData.runtime);
+    const airDate = parseDate(epData?.air_date || showData?.first_air_date);
+    const runtime = formatMinutes(epData?.runtime || (showData?.episode_run_time || [])[0]);
 
     let specialCut = null;
     const editionPattern = /director|extended|unrated|special edition|alternate|superfan/i;
 
-    // 1. Episode Title/Overview check
-    if (epData.name && editionPattern.test(epData.name)) {
-      specialCut = { editionName: epData.name, runtime };
-    } else if (epData.overview && editionPattern.test(epData.overview)) {
-      const match = epData.overview.match(/(\d+)\s*(?:min|mins|m\b)/i);
-      const altRuntime = match ? formatMinutes(parseInt(match[1], 10)) : null;
-      specialCut = { editionName: "Extended Cut", runtime: altRuntime };
-    }
+    if (epData) {
+      if (epData.name && editionPattern.test(epData.name)) {
+        specialCut = { editionName: epData.name, runtime };
+      } else if (epData.overview && editionPattern.test(epData.overview)) {
+        const match = epData.overview.match(/(\d+)\s*(?:min|mins|m\b)/i);
+        const altRuntime = match ? formatMinutes(parseInt(match[1], 10)) : null;
+        specialCut = { editionName: "Extended Cut", runtime: altRuntime };
+      }
 
-    // 2. TMDB Season 0 Specials check
-    if (!specialCut) {
-      try {
-        const specials = await tmdbGet(`/tv/${tvId}/season/0`, creds);
-        const epTitleNorm = (epData.name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      if (!specialCut) {
+        try {
+          const specials = await tmdbGet(`/tv/${tvId}/season/0`, creds);
+          const epTitleNorm = (epData.name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 
-        for (const spec of specials.episodes || []) {
-          const specNameNorm = (spec.name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-          if (
-            editionPattern.test(spec.name) &&
-            (specNameNorm.includes(epTitleNorm) || specNameNorm.includes(`s${season}e${episode}`))
-          ) {
-            specialCut = {
-              editionName: spec.name.trim(),
-              runtime: formatMinutes(spec.runtime)
-            };
-            break;
+          for (const spec of specials.episodes || []) {
+            const specNameNorm = (spec.name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+            if (
+              editionPattern.test(spec.name) &&
+              (specNameNorm.includes(epTitleNorm) || specNameNorm.includes(`s${season}e${episode}`))
+            ) {
+              specialCut = {
+                editionName: spec.name.trim(),
+                runtime: formatMinutes(spec.runtime)
+              };
+              break;
+            }
           }
+        } catch {
+          // No Season 0
         }
-      } catch {
-        // Ignore if no specials
+      }
+
+      if (!specialCut && creds.tvdbKey) {
+        const tvdbMatch = await fetchTvdbSpecialCut(imdbId, epData.name, season, episode, creds.tvdbKey);
+        if (tvdbMatch) specialCut = tvdbMatch;
       }
     }
 
-    // 3. TheTVDB v4 check
-    if (!specialCut && creds.tvdbKey) {
-      const tvdbMatch = await fetchTvdbSpecialCut(imdbId, epData.name, season, episode, creds.tvdbKey);
-      if (tvdbMatch) {
-        specialCut = tvdbMatch;
-      }
-    }
-
-    // 4. Curated Alternate Cut Catalog (e.g. BSG Pegasus)
     if (!specialCut) {
       const manualKey = `${tvId}:${season}:${episode}`;
-      if (KNOWN_TV_CUTS[manualKey]) {
-        specialCut = KNOWN_TV_CUTS[manualKey];
-      }
+      if (KNOWN_TV_CUTS[manualKey]) specialCut = KNOWN_TV_CUTS[manualKey];
     }
 
     // Multi-tier Adaptation Check
     const sources = [];
 
-    const epSources = extractSourceMaterial(epData.credits?.crew || []);
-    const epArc = extractStoryArcFromText(epData.overview);
-    if (epArc) sources.push(`"${epArc}"`);
-    sources.push(...epSources);
+    if (epData) {
+      const epSources = extractSourceMaterial(epData.credits?.crew || []);
+      const epArc = extractStoryArcFromText(epData.overview);
+      if (epArc) sources.push(`"${epArc}"`);
+      sources.push(...epSources);
+    }
 
     if (seasonData) {
       const seasonArc = extractStoryArcFromText(seasonData.overview);
@@ -525,11 +532,12 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     let franchise = null;
 
-    if (KNOWN_SERIES_CONTINUITY[String(tvId)]) {
-      const known = KNOWN_SERIES_CONTINUITY[String(tvId)];
-      if (known.franchise) franchise = known.franchise;
-      if (known.basedOn && !sources.some(s => s.toLowerCase().includes(known.basedOn.toLowerCase()))) {
-        sources.unshift(known.basedOn);
+    // Check Curated Overrides for known franchises (dual-key matching tvId & imdbId)
+    const knownMatch = KNOWN_SERIES_CONTINUITY[String(tvId)] || (imdbId ? KNOWN_SERIES_CONTINUITY[imdbId] : null);
+    if (knownMatch) {
+      if (knownMatch.franchise) franchise = knownMatch.franchise;
+      if (knownMatch.basedOn && !sources.some(s => s.toLowerCase().includes(knownMatch.basedOn.toLowerCase()))) {
+        sources.unshift(knownMatch.basedOn);
       }
     }
 
@@ -549,18 +557,20 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
     }
 
+    const episodeTitle = epData?.name || `S${season}E${episode}`;
+
     const value = {
       type: "series",
       tvId,
       season,
       episode,
-      title: epData.name || `S${season}E${episode}`,
+      title: episodeTitle,
       airDate,
       runtime,
       specialCut,
       sourceMaterial: [...new Set(sources)].slice(0, 2),
       franchise,
-      wikiUrl: wiki.wikiUrl
+      wikiUrl: wiki?.wikiUrl || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`
     };
 
     cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
@@ -683,7 +693,7 @@ app.get("/", (_req, res) => {
           <img src="https://thetvdb.com/images/logo.png" alt="TheTVDB Logo" title="TheTVDB" style="filter: brightness(0) invert(1);" />
         </div>
 
-        <p>Displays theatrical & digital release dates, runtimes, episodic & seasonal source material adaptations, and alternate cuts inside Nuvio and Stremio. Clicking open cards opens Wikipedia.</p>
+        <p>Displays theatrical & digital release dates, runtimes, episodic & seasonal source material adaptations, and alternate cuts inside Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
@@ -737,14 +747,14 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "5.1.0",
+  version: "5.2.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "5.1.0",
+    version: "5.2.0",
     name: "Release Info",
     description: "Shows release dates, runtimes, episodic adaptations (books/comics), and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
