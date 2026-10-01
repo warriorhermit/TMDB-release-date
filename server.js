@@ -11,7 +11,7 @@ const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 21600000);
 const cache = new Map();
 const activeRequests = new Map();
 
-// Known TV show ID translations when TMDB /find endpoint is unindexed
+// Known TV show ID translations when TMDB /find endpoint is unindexed or lagging
 const KNOWN_IMDB_TO_TMDB = {
   "tt26540674": "219847", // Lanterns (HBO / DC Studios)
   "tt2375692":  "49010"   // Black Sails
@@ -137,6 +137,62 @@ async function tmdbGet(path, creds) {
 
 // ----------------- Wikidata Engines -----------------
 
+async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epImdbId = null) {
+  let subjectPattern = "";
+  if (epImdbId && /^tt\d+$/i.test(epImdbId)) {
+    subjectPattern = `?ep wdt:P345 "${epImdbId}".`;
+  } else if (seriesImdbId && /^tt\d+$/i.test(seriesImdbId)) {
+    subjectPattern = `
+      ?series wdt:P345 "${seriesImdbId}".
+      ?ep wdt:P179 ?series ;
+          wdt:P4908 ?seasonItem ;
+          wdt:P1083 "${episode}".
+    `;
+  } else {
+    return null;
+  }
+
+  const query = `
+    SELECT ?workLabel ?authorLabel ?article WHERE {
+      ${subjectPattern}
+      ?ep wdt:P144 ?work .
+      OPTIONAL { ?work wdt:P50 ?author . }
+      OPTIONAL {
+        ?article schema:about ?ep ;
+                 schema:isPartOf <https://en.wikipedia.org/> .
+      }
+      SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+    } LIMIT 1
+  `;
+
+  try {
+    const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": "ReleaseInfoAddon/5.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+    });
+
+    if (!res.ok) return null;
+    const json = await res.json();
+    const binding = json?.results?.bindings?.[0];
+
+    const work = binding?.workLabel?.value;
+    const author = binding?.authorLabel?.value;
+    const article = binding?.article?.value;
+
+    if (work && !work.startsWith("Q")) {
+      const authorSuffix = (author && !author.startsWith("Q")) ? ` by ${author}` : "";
+      return {
+        adaptedSource: `Based on "${work}"${authorSuffix}`,
+        episodeWikiUrl: article || null
+      };
+    }
+  } catch (err) {
+    console.warn(`[Wikidata Ep Adaptation Error]: ${err.message}`);
+  }
+
+  return null;
+}
+
 async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatricalMinutes = null) {
   const defaultWikiUrl = fallbackTitle
     ? `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(fallbackTitle)}`
@@ -170,7 +226,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/5.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/5.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
@@ -253,7 +309,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/5.7 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/5.8 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
@@ -616,7 +672,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
   if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
 
   const promise = (async () => {
-    // ----------------- Fast-Path Intercept for Pre-Release Titles -----------------
+    // Fast-path intercept for Lanterns (unreleased on TMDB)
     const rawClean = String(seriesRawId).replace("tmdb:", "");
     if (rawClean === "219847" || rawClean === "tt26540674") {
       const known = KNOWN_SERIES_CONTINUITY["219847"];
@@ -641,7 +697,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     let epData = null;
     if (tvId) {
       try {
-        epData = await tmdbGet(`/tv/${tvId}/season/${season}/episode/${episode}?append_to_response=credits`, creds);
+        epData = await tmdbGet(`/tv/${tvId}/season/${season}/episode/${episode}?append_to_response=credits,external_ids`, creds);
       } catch {
         // Episode not indexed yet
       }
@@ -705,16 +761,31 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (KNOWN_TV_CUTS[manualKey]) specialCut = KNOWN_TV_CUTS[manualKey];
     }
 
-    // Multi-tier Adaptation Check
+    // ----------------- Individual Episode Source Material Extraction -----------------
     const sources = [];
+    const epImdbId = epData?.external_ids?.imdb_id || null;
+    let episodeWikiUrl = null;
 
-    if (epData) {
-      const epSources = extractSourceMaterial(epData.credits?.crew || []);
-      const epArc = extractStoryArcFromText(epData.overview);
-      if (epArc) sources.push(`"${epArc}"`);
-      sources.push(...epSources);
+    // 1. Scrape Wikidata directly for the individual episode's source adaptation
+    const epWikiData = await fetchWikidataEpisodeAdaptation(imdbId, season, episode, epImdbId);
+    if (epWikiData?.adaptedSource) {
+      sources.push(epWikiData.adaptedSource);
+      if (epWikiData.episodeWikiUrl) episodeWikiUrl = epWikiData.episodeWikiUrl;
     }
 
+    // 2. Check Episode credits & synopsis for specific novel/comic issue
+    if (epData) {
+      const epArc = extractStoryArcFromText(epData.overview);
+      if (epArc && !sources.some(s => s.includes(epArc))) {
+        sources.push(`Based on "${epArc}"`);
+      }
+      const epSources = extractSourceMaterial(epData.credits?.crew || []);
+      for (const s of epSources) {
+        if (!sources.includes(s)) sources.push(s);
+      }
+    }
+
+    // 3. Check Season credits & synopsis (e.g., Reacher S01 adapting "Killing Floor")
     if (seasonData) {
       const seasonArc = extractStoryArcFromText(seasonData.overview);
       if (seasonArc && !sources.some(s => s.includes(seasonArc))) {
@@ -726,10 +797,13 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
     }
 
-    const seriesSources = extractSourceMaterial(showData?.aggregate_credits?.crew || []);
-    for (const s of seriesSources) {
-      if (!sources.some(existing => existing.toLowerCase().includes(s.toLowerCase()))) {
-        sources.push(s);
+    // 4. Fall back to Series-level aggregate credits
+    if (sources.length === 0) {
+      const seriesSources = extractSourceMaterial(showData?.aggregate_credits?.crew || []);
+      for (const s of seriesSources) {
+        if (!sources.some(existing => existing.toLowerCase().includes(s.toLowerCase()))) {
+          sources.push(s);
+        }
       }
     }
 
@@ -784,6 +858,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     const episodeTitle = epData?.name || (showData?.name ? `${showData.name} (In Production)` : `S${season}E${episode}`);
+    const finalWikiUrl = episodeWikiUrl || knownMatch?.wikiUrl || wiki?.wikiUrl || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`;
 
     const value = {
       type: "series",
@@ -797,7 +872,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       sourceMaterial: [...new Set(sources)].slice(0, 2),
       franchise,
       revivalOf,
-      wikiUrl: knownMatch?.wikiUrl || wiki?.wikiUrl || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`
+      wikiUrl: finalWikiUrl
     };
 
     cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
@@ -928,7 +1003,7 @@ app.get("/", (_req, res) => {
           <img src="https://thetvdb.com/images/logo.png" alt="TheTVDB Logo" title="TheTVDB" style="filter: brightness(0) invert(1);" />
         </div>
 
-        <p>Displays theatrical & digital release dates, runtimes (theatrical & extended cuts via TMDB/Wikidata/TVDB), source adaptations, revivals, and franchise continuity inside Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
+        <p>Displays release dates, theatrical & extended runtimes, episodic & seasonal source material adaptations, revivals, and franchise continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
@@ -982,16 +1057,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "5.7.0",
+  version: "5.8.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "5.7.0",
+    version: "5.8.0",
     name: "Release Info",
-    description: "Shows release dates, runtimes (theatrical & extended cuts), source adaptations, revivals, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
+    description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/comics), and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
     resources: [
       "stream",
@@ -1058,7 +1133,7 @@ async function handleStream(req, res) {
     console.error(`[${type}:${id}] ${e.message}`);
     return res.json({
       streams: [{
-        name: "⚠️ Release Info",
+        name: "⚠️️ Release Info",
         title: `Error: ${e.message}`,
         description: e.message,
         externalUrl: "https://en.wikipedia.org/"
