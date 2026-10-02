@@ -16,7 +16,8 @@ const KNOWN_IMDB_TO_TMDB = {
   "tt26540674": "219847", // Lanterns (HBO / DC Studios)
   "tt2375692":  "49010",  // Black Sails
   "tt3581920":  "100088", // The Last of Us
-  "tt12637874": "106379"  // Fallout
+  "tt12637874": "106379", // Fallout
+  "tt7661390":  "85021"   // Gangs of London
 };
 
 // Curated dictionary for legendary movie alternate/extended cuts with running times
@@ -43,8 +44,23 @@ const KNOWN_TV_CUTS = {
   "1972:4:20": { editionName: "Extended Finale", runtime: "2h 32m" } // BSG Daybreak
 };
 
-// Curated backup for notable adaptations / continuity / pre-release titles / video game franchises
+// Curated backup for notable adaptations / continuity / spin-offs / pre-release titles
 const KNOWN_SERIES_CONTINUITY = {
+  // Gangs of London (Spin-off of The Getaway video game franchise)
+  "85021": {
+    franchise: "The Getaway Franchise",
+    spinOffOf: "The Getaway (Video Game Series)",
+    basedOn: "Video Game: Gangs of London (Sony London Studio)",
+    wikiUrl: "https://en.wikipedia.org/wiki/Gangs_of_London_(TV_series)"
+  },
+  "tt7661390": {
+    franchise: "The Getaway Franchise",
+    spinOffOf: "The Getaway (Video Game Series)",
+    basedOn: "Video Game: Gangs of London (Sony London Studio)",
+    wikiUrl: "https://en.wikipedia.org/wiki/Gangs_of_London_(TV_series)"
+  },
+
+  // Video Game Adaptations
   "100088": {
     franchise: "The Last of Us Universe",
     basedOn: "Video Game: The Last of Us (Naughty Dog / PlayStation)",
@@ -85,6 +101,8 @@ const KNOWN_SERIES_CONTINUITY = {
     basedOn: "Video Game: Castlevania (Konami)",
     wikiUrl: "https://en.wikipedia.org/wiki/Castlevania_(TV_series)"
   },
+
+  // Lanterns (HBO / DC Studios)
   "219847": {
     title: "Lanterns",
     franchise: "DC Universe",
@@ -99,6 +117,8 @@ const KNOWN_SERIES_CONTINUITY = {
     expectedAir: "Expected 2026",
     wikiUrl: "https://en.wikipedia.org/wiki/Lanterns_(TV_series)"
   },
+
+  // Black Sails (Prequel to Treasure Island)
   "49010": {
     franchise: "Treasure Island Universe",
     basedOn: "Prequel to 'Treasure Island' by Robert Louis Stevenson",
@@ -109,6 +129,8 @@ const KNOWN_SERIES_CONTINUITY = {
     basedOn: "Prequel to 'Treasure Island' by Robert Louis Stevenson",
     wikiUrl: "https://en.wikipedia.org/wiki/Black_Sails_(TV_series)"
   },
+
+  // Scrubs Revival
   "scrubs": {
     franchise: "Scrubs Universe",
     revivalOf: "Revival of Scrubs (2001–2010)",
@@ -268,7 +290,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.0 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return null;
@@ -295,11 +317,11 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
     : "https://en.wikipedia.org/";
 
   if (!imdbId || !/^tt\d+$/i.test(imdbId)) {
-    return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
   }
 
   const query = `
-    SELECT ?franchiseLabel ?workLabel ?workTypeLabel ?creatorLabel ?subjectLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?article ?duration ?editionLabel WHERE {
+    SELECT ?franchiseLabel ?workLabel ?workTypeLabel ?creatorLabel ?subjectLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?spinOffLabel ?article ?duration ?editionLabel WHERE {
       ?item wdt:P345 "${imdbId}".
       OPTIONAL { ?item wdt:P179 ?franchise. }
       OPTIONAL {
@@ -320,6 +342,10 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
         ?item wdt:P941 ?mythItem .
         ?mythItem rdfs:label ?mythLabel filter (lang(?mythLabel) = "en") .
       }
+      OPTIONAL {
+        { ?item wdt:P8345 ?spinItem . } UNION { ?item wdt:P144 ?spinItem . ?spinItem wdt:P31/wdt:P279* wd:Q11424 . }
+        ?spinItem rdfs:label ?spinOffLabel filter (lang(?spinOffLabel) = "en") .
+      }
       OPTIONAL { ?item wdt:P155 ?follows. }
       OPTIONAL { ?item wdt:P156 ?followedBy. }
       OPTIONAL { ?item wdt:P361 ?partOf. }
@@ -339,19 +365,20 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.0 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
-    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
     const json = await res.json();
     const bindings = json?.results?.bindings || [];
-    if (bindings.length === 0) return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    if (bindings.length === 0) return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
 
     const first = bindings[0];
     const franchise = first?.franchiseLabel?.value;
     const follows = first?.followsLabel?.value;
     const followedBy = first?.followedByLabel?.value;
     const partOf = first?.partOfLabel?.value;
+    const spinOff = first?.spinOffLabel?.value;
     const wikiUrl = first?.article?.value || defaultWikiUrl;
 
     const basedOn = formatWikidataAdaptation(first);
@@ -379,12 +406,13 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
       basedOn,
       follows: follows && !follows.startsWith("Q") ? follows : null,
       followedBy: followedBy && !followedBy.startsWith("Q") ? followedBy : null,
+      spinOffOf: spinOff && !spinOff.startsWith("Q") ? spinOff : null,
       specialCut,
       wikiUrl
     };
   } catch (err) {
     console.warn(`[Wikidata Movie Error for ${imdbId}]: ${err.message}`);
-    return { franchise: null, basedOn: null, follows: null, followedBy: null, specialCut: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
   }
 }
 
@@ -394,11 +422,11 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
     : "https://en.wikipedia.org/";
 
   if (!imdbId || !/^tt\d+$/i.test(imdbId)) {
-    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, spinOffOf: null, wikiUrl: defaultWikiUrl };
   }
 
   const query = `
-    SELECT ?franchiseLabel ?workLabel ?workTypeLabel ?creatorLabel ?subjectLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?article
+    SELECT ?franchiseLabel ?workLabel ?workTypeLabel ?creatorLabel ?subjectLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?spinOffLabel ?article
            ?predecessorLabel (YEAR(?origStart) AS ?origStartY) (YEAR(?origEnd) AS ?origEndY) WHERE {
       ?item wdt:P345 "${imdbId}".
       OPTIONAL { ?item wdt:P179 ?franchise. }
@@ -420,6 +448,10 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
         ?item wdt:P941 ?mythItem .
         ?mythItem rdfs:label ?mythLabel filter (lang(?mythLabel) = "en") .
       }
+      OPTIONAL {
+        { ?item wdt:P8345 ?spinItem . } UNION { ?item wdt:P144 ?spinItem . ?spinItem wdt:P31/wdt:P279* wd:Q5398426 . }
+        ?spinItem rdfs:label ?spinOffLabel filter (lang(?spinOffLabel) = "en") .
+      }
       OPTIONAL { ?item wdt:P155 ?follows. }
       OPTIONAL { ?item wdt:P156 ?followedBy. }
       OPTIONAL { ?item wdt:P361 ?partOf. }
@@ -439,10 +471,10 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.0 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
-    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, spinOffOf: null, wikiUrl: defaultWikiUrl };
     const json = await res.json();
     const binding = json?.results?.bindings?.[0];
 
@@ -450,6 +482,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
     const follows = binding?.followsLabel?.value;
     const followedBy = binding?.followedByLabel?.value;
     const partOf = binding?.partOfLabel?.value;
+    const spinOff = binding?.spinOffLabel?.value;
     const wikiUrl = binding?.article?.value || defaultWikiUrl;
 
     const basedOn = formatWikidataAdaptation(binding);
@@ -469,12 +502,13 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
       basedOn,
       follows: follows && !follows.startsWith("Q") ? follows : null,
       followedBy: followedBy && !followedBy.startsWith("Q") ? followedBy : null,
+      spinOffOf: spinOff && !spinOff.startsWith("Q") ? spinOff : null,
       revivalOf,
       wikiUrl
     };
   } catch (err) {
     console.warn(`[Wikidata Details Error for ${imdbId}]: ${err.message}`);
-    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, wikiUrl: defaultWikiUrl };
+    return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, spinOffOf: null, wikiUrl: defaultWikiUrl };
   }
 }
 
@@ -599,24 +633,30 @@ function extractSourceMaterial(crew = [], keywords = []) {
 }
 
 function extractStoryArcFromText(text = "") {
-  if (!text) return null;
+  if (!text) return { arc: null, spinOff: null };
+
+  let spinOff = null;
+  const spinMatch = text.match(/(?:spin[- ]?off|spinoff)\s+(?:of|from)\s+(?:the\s+(?:hit\s+|acclaimed\s+)?(?:series|show|film|movie|franchise)\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
+  if (spinMatch && spinMatch[1]) {
+    spinOff = spinMatch[1].trim();
+  }
 
   // 1. Real events, true accounts, history
   const realMatch = text.match(/(?:based on|inspired by|chronicles|depicts?|dramatiz(?:ing|ation of))\s+(?:the\s+)?(?:true\s+(?:story|events?|account)|real[- ]life\s+(?:story|events?|incident|disaster|mission|case)|actual events?)(?:\s+(?:of|surrounding|involving)\s+["'“]?([^"'”.,;]+)["'”]?)?/i);
   if (realMatch) {
-    return realMatch[1] ? `Real Event: ${realMatch[1].trim()}` : "Based on real-life events";
+    return { arc: realMatch[1] ? `Real Event: ${realMatch[1].trim()}` : "Based on real-life events", spinOff };
   }
 
   // 2. Stage plays & Broadway
   const playMatch = text.match(/(?:based on|adapted from)\s+(?:the\s+)?(?:acclaimed\s+|broadway\s+|award[- ]winning\s+)?(?:stage\s+play|theatre\s+play|theater\s+play|play|musical)\s+["'“]([^"'”]+)["'”]/i);
   if (playMatch && playMatch[1]) {
-    return `Stage Play: "${playMatch[1].trim()}"`;
+    return { arc: `Stage Play: "${playMatch[1].trim()}"`, spinOff };
   }
 
   // 3. Novella
   const novellaMatch = text.match(/(?:based on|adapted from)\s+(?:the\s+)?novella\s+["'“]([^"'”]+)["'”]/i);
   if (novellaMatch && novellaMatch[1]) {
-    return `Novella: "${novellaMatch[1].trim()}"`;
+    return { arc: `Novella: "${novellaMatch[1].trim()}"`, spinOff };
   }
 
   // 4. Mythology & Folklore
@@ -624,18 +664,18 @@ function extractStoryArcFromText(text = "") {
   if (mythMatch) {
     const mythType = mythMatch[1].trim();
     const title = mythMatch[2] ? ` ("${mythMatch[2].trim()}")` : "";
-    return `Mythology: ${mythType} Legend${title}`;
+    return { arc: `Mythology: ${mythType} Legend${title}`, spinOff };
   }
 
   // 5. Video Games
   const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:hit\s+|acclaimed\s+|popular\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
   if (vgMatch && vgMatch[1]) {
-    return `Video Game: ${vgMatch[1].trim()}`;
+    return { arc: `Video Game: ${vgMatch[1].trim()}`, spinOff };
   }
 
   // 6. Books / Novels / Comics
   const arcMatch = text.match(/(?:based on|adapted from|adapting)\s+(?:the\s+(?:book|novel|comic|graphic novel)\s+)?["'“]([^"'”]+)["'”]/i);
-  return arcMatch && arcMatch[1] ? arcMatch[1].trim() : null;
+  return { arc: arcMatch && arcMatch[1] ? arcMatch[1].trim() : null, spinOff };
 }
 
 function formatMinutes(minutes) {
@@ -750,7 +790,7 @@ async function resolveTvShow(rawId, creds) {
       try {
         details = await tmdbGet(`/tv/${resolvedTvId}?append_to_response=external_ids,aggregate_credits,keywords`, creds);
       } catch {
-        details = { name: "Lanterns", id: resolvedTvId };
+        details = { name: "Series", id: resolvedTvId };
       }
       return { tvId: resolvedTvId, imdbId: rawId, showData: details };
     }
@@ -809,10 +849,11 @@ async function getMovieInfo(rawId, creds) {
     const sourceMaterial = extractSourceMaterial(movie.credits?.crew || [], movieKeywords);
     let franchise = movie.belongs_to_collection ? movie.belongs_to_collection.name : null;
 
-    // Check movie overview & tagline for adaptations, plays, novellas, real events, and mythology
-    const overviewArc = extractStoryArcFromText(`${movie.overview || ""} ${movie.tagline || ""}`);
-    if (overviewArc && !sourceMaterial.some(s => s.toLowerCase().includes(overviewArc.toLowerCase()))) {
-      sourceMaterial.unshift(overviewArc);
+    let spinOffOf = null;
+    const parsedText = extractStoryArcFromText(`${movie.overview || ""} ${movie.tagline || ""}`);
+    if (parsedText.spinOff) spinOffOf = parsedText.spinOff;
+    if (parsedText.arc && !sourceMaterial.some(s => s.toLowerCase().includes(parsedText.arc.toLowerCase()))) {
+      sourceMaterial.unshift(parsedText.arc);
     }
 
     const movieTitle = movie.title || movie.original_title || "";
@@ -820,6 +861,7 @@ async function getMovieInfo(rawId, creds) {
 
     if (wiki) {
       if (!franchise && wiki.franchise) franchise = wiki.franchise;
+      if (!spinOffOf && wiki.spinOffOf) spinOffOf = wiki.spinOffOf;
       if (wiki.basedOn && !sourceMaterial.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sourceMaterial.unshift(wiki.basedOn);
       } else if (wiki.follows && !franchise) {
@@ -844,6 +886,7 @@ async function getMovieInfo(rawId, creds) {
       specialCut,
       sourceMaterial: [...new Set(sourceMaterial)].slice(0, 2),
       franchise,
+      spinOffOf,
       wikiUrl: wiki.wikiUrl
     };
 
@@ -878,6 +921,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
         specialCut: null,
         sourceMaterial: [known.basedOn],
         franchise: known.franchise,
+        spinOffOf: null,
         revivalOf: null,
         wikiUrl: known.wikiUrl
       };
@@ -956,11 +1000,15 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     const sources = [];
     const epImdbId = epData?.external_ids?.imdb_id || null;
     let episodeWikiUrl = null;
+    let spinOffOf = null;
 
-    // 1. Check curated catalog first (video games, known adaptations)
+    // 1. Check curated catalog first (continuity, spin-offs, games)
     const knownMatch = (tvId ? KNOWN_SERIES_CONTINUITY[String(tvId)] : null) || (imdbId ? KNOWN_SERIES_CONTINUITY[imdbId] : null);
     if (knownMatch?.basedOn) {
       sources.push(knownMatch.basedOn);
+    }
+    if (knownMatch?.spinOffOf) {
+      spinOffOf = knownMatch.spinOffOf;
     }
 
     // 2. Scrape Wikidata directly for episode adaptations (plays, novels, events, myths)
@@ -972,9 +1020,10 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     // 3. Check Episode credits & synopsis
     if (epData) {
-      const epArc = extractStoryArcFromText(epData.overview);
-      if (epArc && !sources.some(s => s.toLowerCase().includes(epArc.toLowerCase()))) {
-        sources.push(epArc);
+      const parsedEp = extractStoryArcFromText(epData.overview);
+      if (parsedEp.spinOff && !spinOffOf) spinOffOf = parsedEp.spinOff;
+      if (parsedEp.arc && !sources.some(s => s.toLowerCase().includes(parsedEp.arc.toLowerCase()))) {
+        sources.push(parsedEp.arc);
       }
       const epSources = extractSourceMaterial(epData.credits?.crew || [], []);
       for (const s of epSources) {
@@ -984,9 +1033,10 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     // 4. Check Season synopsis & credits
     if (seasonData) {
-      const seasonArc = extractStoryArcFromText(seasonData.overview);
-      if (seasonArc && !sources.some(s => s.toLowerCase().includes(seasonArc.toLowerCase()))) {
-        sources.push(seasonArc);
+      const parsedSeason = extractStoryArcFromText(seasonData.overview);
+      if (parsedSeason.spinOff && !spinOffOf) spinOffOf = parsedSeason.spinOff;
+      if (parsedSeason.arc && !sources.some(s => s.toLowerCase().includes(parsedSeason.arc.toLowerCase()))) {
+        sources.push(parsedSeason.arc);
       }
       const seasonSources = extractSourceMaterial(seasonData.credits?.crew || [], []);
       for (const s of seasonSources) {
@@ -1004,9 +1054,10 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     if (showData?.overview) {
-      const seriesOverviewArc = extractStoryArcFromText(showData.overview);
-      if (seriesOverviewArc && !sources.some(s => s.toLowerCase().includes(seriesOverviewArc.toLowerCase()))) {
-        sources.push(seriesOverviewArc);
+      const parsedShow = extractStoryArcFromText(showData.overview);
+      if (parsedShow.spinOff && !spinOffOf) spinOffOf = parsedShow.spinOff;
+      if (parsedShow.arc && !sources.some(s => s.toLowerCase().includes(parsedShow.arc.toLowerCase()))) {
+        sources.push(parsedShow.arc);
       }
     }
 
@@ -1024,6 +1075,9 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
       if (!revivalOf && wiki.revivalOf) {
         revivalOf = wiki.revivalOf;
+      }
+      if (!spinOffOf && wiki.spinOffOf) {
+        spinOffOf = wiki.spinOffOf;
       }
       if (wiki.basedOn && !sources.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sources.unshift(wiki.basedOn);
@@ -1064,6 +1118,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       specialCut,
       sourceMaterial: [...new Set(sources)].slice(0, 2),
       franchise,
+      spinOffOf,
       revivalOf,
       wikiUrl: finalWikiUrl
     };
@@ -1096,7 +1151,11 @@ function streamMovie(info) {
   if (info.specialCut) {
     const name = info.specialCut.editionName || "Extended Cut";
     const runtime = info.specialCut.runtime ? ` [Running Time: ${info.specialCut.runtime}]` : "";
-    lines.push(`✂️ ${name}${runtime}`);
+    lines.push(`✂️️ ${name}${runtime}`);
+  }
+
+  if (info.spinOffOf) {
+    lines.push(`🔀 Spin-off of: ${info.spinOffOf}`);
   }
 
   if (info.revivalOf) {
@@ -1134,6 +1193,10 @@ function streamEpisode(info) {
     const name = info.specialCut.editionName || "Extended Cut";
     const runtime = info.specialCut.runtime ? ` [Running Time: ${info.specialCut.runtime}]` : "";
     lines.push(`✂️ ${name}${runtime}`);
+  }
+
+  if (info.spinOffOf) {
+    lines.push(`🔀 Spin-off of: ${info.spinOffOf}`);
   }
 
   if (info.revivalOf) {
@@ -1196,7 +1259,7 @@ app.get("/", (_req, res) => {
           <img src="https://thetvdb.com/images/logo.png" alt="TheTVDB Logo" title="TheTVDB" style="filter: brightness(0) invert(1);" />
         </div>
 
-        <p>Displays release dates, theatrical & extended runtimes, episodic & seasonal adaptations (books, plays, novellas, real-life events, mythology), revivals, and franchise continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
+        <p>Displays release dates, theatrical & extended runtimes, episodic & seasonal adaptations (books, plays, real-life events, mythology), spin-offs, revivals, and franchise continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
@@ -1250,16 +1313,16 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "6.0.0",
+  version: "6.1.0",
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.0.0",
+    version: "6.1.0",
     name: "Release Info",
-    description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/novellas/plays/mythology/real events), and franchise continuity for Movies & TV series in Nuvio/Stremio.",
+    description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/novellas/plays/mythology/real events), spin-offs, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
     resources: [
       "stream",
