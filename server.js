@@ -218,27 +218,28 @@ async function tmdbGet(path, creds) {
   return data;
 }
 
-// ----------------- Gemini AI Engine (With Fallback) -----------------
+// ----------------- Gemini AI Engines (With Fallback) -----------------
 
-async function analyzeMediaWithAI(title, year, overview, mediaType = "series", apiKey) {
+async function analyzeMediaWithAI(title, year, overview, mediaType = "movie", apiKey) {
   if (!apiKey || !title) return null;
-
-  if (Date.now() < geminiDisabledUntil) {
-    return null;
-  }
+  if (Date.now() < geminiDisabledUntil) return null;
 
   const prompt = `
-You are a film and television archivist. Analyze the following ${mediaType}:
+You are a film and television archivist. Analyze this ${mediaType}:
 Title: "${title}"
-Release Year: ${year || "Unknown"}
+Year: ${year || "Unknown"}
 Overview: "${overview || ""}"
 
-Respond ONLY with a JSON object (no markdown, no backticks, no code blocks):
+Respond strictly with a JSON object (no markdown, no backticks):
 {
-  "basedOn": string or null (Format: 'Video Game: Game Title (Developer/Publisher)', 'Novel: Book Title by Author', 'Stage Play: Play Title by Playwright', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
+  "basedOn": string or null (Format: 'Video Game: Title (Dev)', 'Novel: Title by Author', 'Stage Play: Title by Author', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
   "isRealLifeEvent": string or null (Name of real historical event, disaster, war, or true incident ONLY. If fiction, vampires, supernatural, fantasy, or sci-fi, this MUST be null),
-  "spinOffOf": string or null (Parent series or game if this is a direct spin-off, e.g. 'The Getaway', 'Breaking Bad', 'The Vampire Diaries', otherwise null),
-  "franchise": string or null (Cinematic or universe name if applicable, e.g. 'The Vampire Diaries Universe', 'PlayStation Productions', otherwise null)
+  "spinOffOf": string or null (Parent series or game if direct spin-off, e.g. 'The Getaway', 'Breaking Bad', 'The Vampire Diaries', otherwise null),
+  "franchise": string or null (Cinematic or universe name if applicable, e.g. 'The Vampire Diaries Universe', 'PlayStation Productions', otherwise null),
+  "specialCut": {
+    "editionName": string or null (e.g. "Director's Cut", "Extended Edition", "The Final Cut", "Special Edition", or null if none),
+    "runtime": string or null (Formatted runtime like "3h 14m", "2h 45m", or null if unknown)
+  }
 }
 `;
 
@@ -256,15 +257,12 @@ Respond ONLY with a JSON object (no markdown, no backticks, no code blocks):
     });
 
     if (res.status === 429) {
-      console.warn(`[Gemini API Rate Limit Reached]: Trip circuit breaker for 5 mins.`);
+      console.warn(`[Gemini API Rate Limit Reached]: Tripping circuit breaker for 5 mins.`);
       geminiDisabledUntil = Date.now() + 300000;
       return null;
     }
 
-    if (!res.ok) {
-      console.warn(`[Gemini HTTP ${res.status}]: Falling back to local engines.`);
-      return null;
-    }
+    if (!res.ok) return null;
 
     const data = await res.json();
     const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -272,7 +270,60 @@ Respond ONLY with a JSON object (no markdown, no backticks, no code blocks):
 
     return JSON.parse(textResponse.trim());
   } catch (err) {
-    console.warn(`[Gemini Exception for ${title}]: ${err.message}. Using fallback engine.`);
+    console.warn(`[Gemini Movie Analysis Failed for ${title}]: ${err.message}.`);
+    return null;
+  }
+}
+
+async function analyzeEpisodeWithAI(showTitle, season, episode, epTitle, epOverview, seasonOverview, apiKey) {
+  if (!apiKey || !showTitle) return null;
+  if (Date.now() < geminiDisabledUntil) return null;
+
+  const prompt = `
+You are a television archivist. Analyze Season ${season}, Episode ${episode} of the series "${showTitle}":
+Episode Title: "${epTitle || `S${season}E${episode}`}"
+Episode Overview: "${epOverview || ""}"
+Season Overview: "${seasonOverview || ""}"
+
+Respond strictly with a JSON object (no markdown, no backticks):
+{
+  "adaptedSource": string or null (Specific short story, comic issue, book chapter, or play this episode is individually adapted from, e.g. 'Short Story: "The Sentinel" by Arthur C. Clarke', otherwise null),
+  "isRealLifeEvent": string or null (Specific real-life historical incident, true-crime event, or disaster depicted in this episode, or null if fictional/supernatural),
+  "specialCut": {
+    "editionName": string or null (Any extended episode cut, director's cut, superfan cut for this specific episode, e.g. "Extended Cut", "Superfan Episode", or null),
+    "runtime": string or null (Formatted runtime like "1h 10m" or "58m", or null if unknown)
+  }
+}
+`;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: "application/json"
+        }
+      })
+    });
+
+    if (res.status === 429) {
+      console.warn(`[Gemini API Rate Limit Reached]: Tripping circuit breaker for 5 mins.`);
+      geminiDisabledUntil = Date.now() + 300000;
+      return null;
+    }
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!textResponse) return null;
+
+    return JSON.parse(textResponse.trim());
+  } catch (err) {
+    console.warn(`[Gemini Ep Analysis Failed for ${showTitle} S${season}E${episode}]: ${err.message}.`);
     return null;
   }
 }
@@ -371,7 +422,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.3 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return null;
@@ -446,7 +497,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.3 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
@@ -552,7 +603,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.3 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, spinOffOf: null, wikiUrl: defaultWikiUrl };
@@ -940,7 +991,7 @@ async function getMovieInfo(rawId, creds) {
     const movieTitle = movie.title || movie.original_title || "";
     const movieYear = (movie.release_date || "").split("-")[0];
 
-    // 1. Try Gemini AI (if key is present and not circuit-broken)
+    // 1. Try Gemini AI (including alternate edition detection)
     if (creds.geminiKey) {
       const aiData = await analyzeMediaWithAI(movieTitle, movieYear, movie.overview, "movie", creds.geminiKey);
       if (aiData) {
@@ -952,10 +1003,16 @@ async function getMovieInfo(rawId, creds) {
         if (aiData.isRealLifeEvent && !sourceMaterial.some(s => s.toLowerCase().includes(aiData.isRealLifeEvent.toLowerCase()))) {
           sourceMaterial.unshift(`Real-life Event: ${aiData.isRealLifeEvent}`);
         }
+        if ((!specialCut || !specialCut.runtime) && aiData.specialCut?.editionName) {
+          specialCut = {
+            editionName: aiData.specialCut.editionName,
+            runtime: aiData.specialCut.runtime || null
+          };
+        }
       }
     }
 
-    // 2. Query Wikidata (Serves as primary or fallback)
+    // 2. Query Wikidata (Primary or fallback)
     const wiki = await fetchWikidataMovieDetails(imdbId, movieTitle, movie.runtime);
     if (wiki) {
       if (!franchise && wiki.franchise) franchise = wiki.franchise;
@@ -1094,22 +1151,18 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (KNOWN_TV_CUTS[manualKey]) specialCut = KNOWN_TV_CUTS[manualKey];
     }
 
-    // ----------------- Individual Episode Source Material Extraction -----------------
+    // ----------------- Source Material Extraction -----------------
     const sources = [];
     const epImdbId = epData?.external_ids?.imdb_id || null;
     let episodeWikiUrl = null;
     let spinOffOf = null;
 
-    // 1. Check curated catalog first (continuity, spin-offs, games)
+    // 1. Curated catalog
     const knownMatch = (tvId ? KNOWN_SERIES_CONTINUITY[String(tvId)] : null) || (imdbId ? KNOWN_SERIES_CONTINUITY[imdbId] : null);
-    if (knownMatch?.basedOn) {
-      sources.push(knownMatch.basedOn);
-    }
-    if (knownMatch?.spinOffOf) {
-      spinOffOf = knownMatch.spinOffOf;
-    }
+    if (knownMatch?.basedOn) sources.push(knownMatch.basedOn);
+    if (knownMatch?.spinOffOf) spinOffOf = knownMatch.spinOffOf;
 
-    // 2. Scrape Wikidata directly for episode adaptations (plays, novels, events, myths)
+    // 2. Scrape Wikidata directly for episode adaptations
     const epWikiData = await fetchWikidataEpisodeAdaptation(imdbId, season, episode, epImdbId);
     if (epWikiData?.adaptedSource && !sources.includes(epWikiData.adaptedSource)) {
       sources.unshift(epWikiData.adaptedSource);
@@ -1164,22 +1217,49 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     const showTitle = showData?.name || showData?.original_name || "";
     const showYear = (epData?.air_date || showData?.first_air_date || "").split("-")[0];
 
-    // 6. Gemini AI analysis (Runs if key is present and circuit breaker hasn't tripped)
+    // 6. Gemini AI: Series, Per-Season & Per-Episode Deep Inspection
     if (creds.geminiKey) {
-      const aiData = await analyzeMediaWithAI(showTitle, showYear, showData?.overview, "series", creds.geminiKey);
-      if (aiData) {
-        if (!spinOffOf && aiData.spinOffOf) spinOffOf = aiData.spinOffOf;
-        if (!franchise && aiData.franchise) franchise = aiData.franchise;
-        if (aiData.basedOn && !sources.some(s => s.toLowerCase().includes(aiData.basedOn.toLowerCase()))) {
-          sources.unshift(aiData.basedOn);
+      // Series & Spin-off inspection
+      const aiShowData = await analyzeMediaWithAI(showTitle, showYear, showData?.overview, "series", creds.geminiKey);
+      if (aiShowData) {
+        if (!spinOffOf && aiShowData.spinOffOf) spinOffOf = aiShowData.spinOffOf;
+        if (!franchise && aiShowData.franchise) franchise = aiShowData.franchise;
+        if (aiShowData.basedOn && !sources.some(s => s.toLowerCase().includes(aiShowData.basedOn.toLowerCase()))) {
+          sources.push(aiShowData.basedOn);
         }
-        if (aiData.isRealLifeEvent && !sources.some(s => s.toLowerCase().includes(aiData.isRealLifeEvent.toLowerCase()))) {
-          sources.unshift(`Real-life Event: ${aiData.isRealLifeEvent}`);
+        if (aiShowData.isRealLifeEvent && !sources.some(s => s.toLowerCase().includes(aiShowData.isRealLifeEvent.toLowerCase()))) {
+          sources.push(`Real-life Event: ${aiShowData.isRealLifeEvent}`);
+        }
+      }
+
+      // Per-Season & Per-Episode Granular Inspection
+      const aiEpData = await analyzeEpisodeWithAI(
+        showTitle,
+        season,
+        episode,
+        epData?.name,
+        epData?.overview,
+        seasonData?.overview,
+        creds.geminiKey
+      );
+
+      if (aiEpData) {
+        if (aiEpData.adaptedSource && !sources.some(s => s.toLowerCase().includes(aiEpData.adaptedSource.toLowerCase()))) {
+          sources.unshift(aiEpData.adaptedSource);
+        }
+        if (aiEpData.isRealLifeEvent && !sources.some(s => s.toLowerCase().includes(aiEpData.isRealLifeEvent.toLowerCase()))) {
+          sources.unshift(`Real-life Event: ${aiEpData.isRealLifeEvent}`);
+        }
+        if ((!specialCut || !specialCut.runtime) && aiEpData.specialCut?.editionName) {
+          specialCut = {
+            editionName: aiEpData.specialCut.editionName,
+            runtime: aiEpData.specialCut.runtime || null
+          };
         }
       }
     }
 
-    // 7. Wikidata Details (Runs as primary metadata source and seamless fallback)
+    // 7. Wikidata Details (Primary or fallback)
     const wiki = await fetchWikidataDetails(imdbId, showTitle);
     if (wiki) {
       if (!franchise && wiki.franchise) {
@@ -1187,12 +1267,8 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
           ? wiki.franchise
           : `${wiki.franchise} Universe`;
       }
-      if (!revivalOf && wiki.revivalOf) {
-        revivalOf = wiki.revivalOf;
-      }
-      if (!spinOffOf && wiki.spinOffOf) {
-        spinOffOf = wiki.spinOffOf;
-      }
+      if (!revivalOf && wiki.revivalOf) revivalOf = wiki.revivalOf;
+      if (!spinOffOf && wiki.spinOffOf) spinOffOf = wiki.spinOffOf;
       if (wiki.basedOn && !sources.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sources.unshift(wiki.basedOn);
       } else if (wiki.follows && !franchise && !revivalOf) {
@@ -1460,7 +1536,7 @@ app.get("/", (_req, res) => {
         <input type="text" id="tvdb" placeholder="e.g. 12345678-abcd-ef01-2345-6789abcdef01" autocomplete="off" />
         <div id="tvdbStatus" class="status-msg"></div>
 
-        <label for="gemini">Google Gemini API Key (Optional for accurate adaptation & spin-off detection)</label>
+        <label for="gemini">Google Gemini API Key (Optional for per-season/episode adaptations & cuts)</label>
         <input type="text" id="gemini" placeholder="AIzaSy..." autocomplete="off" />
         <div id="geminiStatus" class="status-msg"></div>
 
@@ -1572,7 +1648,7 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "6.3.0",
+  version: "6.4.0",
   geminiCircuitBreakerActive: Date.now() < geminiDisabledUntil,
   defaultRegion: DEFAULT_REGION
 }));
@@ -1580,7 +1656,7 @@ app.get("/health", (_req, res) => res.json({
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.3.0",
+    version: "6.4.0",
     name: "Release Info",
     description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/novellas/plays/mythology/real events), spin-offs, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
