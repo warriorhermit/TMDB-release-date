@@ -9,6 +9,9 @@ const SERVER_GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const DEFAULT_REGION = (process.env.DEFAULT_REGION || "US").toUpperCase();
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 21600000);
 
+// Enable JSON body parsing for API key validation
+app.use(express.json());
+
 const cache = new Map();
 const activeRequests = new Map();
 
@@ -162,7 +165,7 @@ let tvdbTokenExpiresAt = 0;
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
@@ -220,7 +223,6 @@ async function tmdbGet(path, creds) {
 async function analyzeMediaWithAI(title, year, overview, mediaType = "series", apiKey) {
   if (!apiKey || !title) return null;
 
-  // Circuit Breaker: Skip if recently rate-limited (HTTP 429)
   if (Date.now() < geminiDisabledUntil) {
     return null;
   }
@@ -254,8 +256,8 @@ Respond ONLY with a JSON object (no markdown, no backticks, no code blocks):
     });
 
     if (res.status === 429) {
-      console.warn(`[Gemini API Rate Limit Reached]: Trip circuit breaker for 5 mins. Falling back to local engines.`);
-      geminiDisabledUntil = Date.now() + 300000; // 5 min cool-off
+      console.warn(`[Gemini API Rate Limit Reached]: Trip circuit breaker for 5 mins.`);
+      geminiDisabledUntil = Date.now() + 300000;
       return null;
     }
 
@@ -306,7 +308,6 @@ function formatWikidataAdaptation(binding) {
     return `${prefix}"${work}"${creatorStr}`;
   }
 
-  // Guard against fictional/supernatural tropes being flagged as real events
   const invalidSubjects = /vampire|werewolf|witch|magic|supernatural|zombie|ghost|monster|high school|fiction|superhero/i;
   const realEvent = event || (subject && !invalidSubjects.test(subject) ? subject : null);
 
@@ -370,7 +371,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.3 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return null;
@@ -445,7 +446,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.3 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
@@ -551,7 +552,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.3 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, spinOffOf: null, wikiUrl: defaultWikiUrl };
@@ -1334,7 +1335,79 @@ function streamEpisode(info) {
   ];
 }
 
-// HTML Configuration UI with TMDB, TVDB & Gemini input
+// ----------------- Live Key Validation Endpoint -----------------
+
+app.post("/api/validate-keys", async (req, res) => {
+  const { tmdb, tvdb, gemini } = req.body || {};
+  const results = {};
+
+  // 1. Validate TMDB
+  if (tmdb) {
+    try {
+      const isToken = tmdb.startsWith("eyJ") || tmdb.length > 50;
+      const url = isToken
+        ? "https://api.themoviedb.org/3/authentication"
+        : `https://api.themoviedb.org/3/configuration?api_key=${encodeURIComponent(tmdb)}`;
+      const headers = isToken ? { Authorization: `Bearer ${tmdb}` } : {};
+
+      const tmdbRes = await fetch(url, { headers });
+      if (tmdbRes.ok) {
+        results.tmdb = { ok: true, message: "Valid TMDB Credentials" };
+      } else {
+        const errJson = await tmdbRes.json().catch(() => ({}));
+        results.tmdb = { ok: false, message: errJson.status_message || `HTTP ${tmdbRes.status}` };
+      }
+    } catch (err) {
+      results.tmdb = { ok: false, message: err.message };
+    }
+  }
+
+  // 2. Validate TheTVDB v4
+  if (tvdb) {
+    try {
+      const tvdbRes = await fetch("https://api4.thetvdb.com/v4/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apikey: tvdb })
+      });
+      if (tvdbRes.ok) {
+        results.tvdb = { ok: true, message: "Valid TheTVDB Project Key" };
+      } else {
+        const errJson = await tvdbRes.json().catch(() => ({}));
+        results.tvdb = { ok: false, message: errJson.message || `HTTP ${tvdbRes.status}` };
+      }
+    } catch (err) {
+      results.tvdb = { ok: false, message: err.message };
+    }
+  }
+
+  // 3. Validate Google Gemini API
+  if (gemini) {
+    try {
+      const geminiRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(gemini)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: "hi" }] }],
+          generationConfig: { maxOutputTokens: 1 }
+        })
+      });
+
+      if (geminiRes.ok) {
+        results.gemini = { ok: true, message: "Valid Gemini API Key" };
+      } else {
+        const errJson = await geminiRes.json().catch(() => ({}));
+        results.gemini = { ok: false, message: errJson.error?.message || `HTTP ${geminiRes.status}` };
+      }
+    } catch (err) {
+      results.gemini = { ok: false, message: err.message };
+    }
+  }
+
+  res.json(results);
+});
+
+// HTML Configuration UI with TMDB, TVDB & Gemini input & Test Tool
 app.get("/", (_req, res) => {
   res.type("html").send(`
     <!DOCTYPE html>
@@ -1345,15 +1418,21 @@ app.get("/", (_req, res) => {
       <title>Configure Release Info Addon</title>
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b1120; color: #f8fafc; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 1rem; box-sizing: border-box; }
-        .card { background: #1e293b; padding: 2.25rem; border-radius: 14px; width: 100%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5); border: 1px solid #334155; }
+        .card { background: #1e293b; padding: 2.25rem; border-radius: 14px; width: 100%; max-width: 520px; box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5); border: 1px solid #334155; }
         h1 { margin-top: 0; font-size: 1.6rem; color: #38bdf8; display: flex; align-items: center; gap: 0.5rem; }
         p { color: #94a3b8; font-size: 0.95rem; line-height: 1.5; margin-bottom: 1.5rem; }
         .logos { display: flex; align-items: center; justify-content: flex-start; gap: 1.5rem; margin-bottom: 1.5rem; padding: 0.75rem 1rem; background: #0f172a; border-radius: 8px; border: 1px solid #1e293b; }
         .logos img { height: 26px; object-fit: contain; }
         label { display: block; margin-top: 1.2rem; font-weight: 500; font-size: 0.9rem; color: #cbd5e1; }
         input[type="text"] { width: 100%; padding: 0.75rem; margin-top: 0.5rem; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #fff; box-sizing: border-box; font-size: 0.9rem; }
-        .btn-primary { width: 100%; padding: 0.8rem; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: 600; margin-top: 1.5rem; cursor: pointer; transition: background 0.2s; font-size: 0.95rem; }
+        .status-msg { font-size: 0.8rem; margin-top: 0.35rem; display: none; }
+        .status-ok { color: #4ade80; }
+        .status-err { color: #f87171; }
+        .btn-group { display: flex; gap: 0.75rem; margin-top: 1.5rem; }
+        .btn-primary { flex: 2; padding: 0.8rem; background: #0284c7; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: background 0.2s; font-size: 0.95rem; }
         .btn-primary:hover { background: #0369a1; }
+        .btn-secondary { flex: 1.2; padding: 0.8rem; background: #334155; color: #f8fafc; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; transition: background 0.2s; font-size: 0.95rem; }
+        .btn-secondary:hover { background: #475569; }
         .result { margin-top: 1.5rem; display: none; }
         .manifest-link { word-break: break-all; background: #0f172a; padding: 0.75rem; border-radius: 6px; font-family: monospace; font-size: 0.85rem; border: 1px solid #334155; margin-top: 0.5rem; color: #a5f3fc; }
         .btn-copy { width: 100%; padding: 0.7rem; background: #334155; color: #f8fafc; border: none; border-radius: 6px; font-weight: 600; margin-top: 0.75rem; cursor: pointer; transition: background 0.2s; }
@@ -1375,14 +1454,21 @@ app.get("/", (_req, res) => {
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
+        <div id="tmdbStatus" class="status-msg"></div>
 
         <label for="tvdb">TheTVDB v4 Project API Key (Optional for extra TV cuts)</label>
         <input type="text" id="tvdb" placeholder="e.g. 12345678-abcd-ef01-2345-6789abcdef01" autocomplete="off" />
+        <div id="tvdbStatus" class="status-msg"></div>
 
         <label for="gemini">Google Gemini API Key (Optional for accurate adaptation & spin-off detection)</label>
         <input type="text" id="gemini" placeholder="AIzaSy..." autocomplete="off" />
+        <div id="geminiStatus" class="status-msg"></div>
 
-        <button class="btn-primary" onclick="generateManifest()">Generate Manifest URL</button>
+        <div class="btn-group">
+          <button class="btn-secondary" id="testBtn" onclick="testApiKeys()">🔍 Test Keys</button>
+          <button class="btn-primary" onclick="generateManifest()">Generate Manifest URL</button>
+        </div>
+
         <div class="result" id="resultBlock">
           <label>Your Custom Manifest URL:</label>
           <div class="manifest-link" id="manifestUrl"></div>
@@ -1394,6 +1480,62 @@ app.get("/", (_req, res) => {
         </div>
       </div>
       <script>
+        async function testApiKeys() {
+          const tmdb = document.getElementById("tmdb").value.trim();
+          const tvdb = document.getElementById("tvdb").value.trim();
+          const gemini = document.getElementById("gemini").value.trim();
+
+          if (!tmdb && !tvdb && !gemini) {
+            return alert("Please enter at least one key to test.");
+          }
+
+          const btn = document.getElementById("testBtn");
+          btn.innerText = "⏳ Testing...";
+          btn.disabled = true;
+
+          const tmdbStatus = document.getElementById("tmdbStatus");
+          const tvdbStatus = document.getElementById("tvdbStatus");
+          const geminiStatus = document.getElementById("geminiStatus");
+
+          [tmdbStatus, tvdbStatus, geminiStatus].forEach(s => {
+            s.style.display = "none";
+            s.className = "status-msg";
+          });
+
+          try {
+            const res = await fetch("/api/validate-keys", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ tmdb, tvdb, gemini })
+            });
+
+            const data = await res.json();
+
+            if (data.tmdb) {
+              tmdbStatus.style.display = "block";
+              tmdbStatus.innerText = data.tmdb.ok ? "✅ " + data.tmdb.message : "❌ " + data.tmdb.message;
+              tmdbStatus.className = "status-msg " + (data.tmdb.ok ? "status-ok" : "status-err");
+            }
+
+            if (data.tvdb) {
+              tvdbStatus.style.display = "block";
+              tvdbStatus.innerText = data.tvdb.ok ? "✅ " + data.tvdb.message : "❌ " + data.tvdb.message;
+              tvdbStatus.className = "status-msg " + (data.tvdb.ok ? "status-ok" : "status-err");
+            }
+
+            if (data.gemini) {
+              geminiStatus.style.display = "block";
+              geminiStatus.innerText = data.gemini.ok ? "✅ " + data.gemini.message : "❌ " + data.gemini.message;
+              geminiStatus.className = "status-msg " + (data.gemini.ok ? "status-ok" : "status-err");
+            }
+          } catch (err) {
+            alert("Validation request failed: " + err.message);
+          } finally {
+            btn.innerText = "🔍 Test Keys";
+            btn.disabled = false;
+          }
+        }
+
         function generateManifest() {
           const tmdb = document.getElementById("tmdb").value.trim();
           const tvdb = document.getElementById("tvdb").value.trim();
@@ -1430,7 +1572,7 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "6.2.0",
+  version: "6.3.0",
   geminiCircuitBreakerActive: Date.now() < geminiDisabledUntil,
   defaultRegion: DEFAULT_REGION
 }));
@@ -1438,7 +1580,7 @@ app.get("/health", (_req, res) => res.json({
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.2.0",
+    version: "6.3.0",
     name: "Release Info",
     description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/novellas/plays/mythology/real events), spin-offs, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
