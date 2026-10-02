@@ -176,16 +176,47 @@ async function tmdbGet(path, creds) {
 
 // ----------------- Source Material & Adaptation Classifier -----------------
 
-function classifyWorkType(workType = "") {
-  const t = workType.toLowerCase();
-  if (/myth|legend|folklore|epic poetry|deity|pantheon/.test(t)) return "Mythology: ";
-  if (/play|theatre|theatrical play|stage play|broadway|drama/.test(t)) return "Stage Play: ";
-  if (/novella/.test(t)) return "Novella: ";
-  if (/novel|book|literary work|short story/.test(t)) return "Novel: ";
-  if (/video game|game/.test(t)) return "Video Game: ";
-  if (/comic|manga|graphic novel/.test(t)) return "Comic: ";
-  if (/historical|real-life|true event|incident|disaster|biography|biographical/.test(t)) return "Real Event: ";
-  return "";
+function formatWikidataAdaptation(binding) {
+  if (!binding) return null;
+
+  const work = binding?.workLabel?.value;
+  const creator = binding?.creatorLabel?.value;
+  const workType = (binding?.workTypeLabel?.value || "").toLowerCase();
+  const subject = binding?.subjectLabel?.value;
+  const event = binding?.eventLabel?.value;
+  const myth = binding?.mythLabel?.value;
+
+  if (work && !work.startsWith("Q")) {
+    let prefix = "Based on: ";
+    if (/theatre|theater|play|stage|broadway|drama|opera/i.test(workType)) {
+      prefix = "Stage Play: ";
+    } else if (/novella/i.test(workType)) {
+      prefix = "Novella: ";
+    } else if (/novel|book|literary/i.test(workType)) {
+      prefix = "Novel: ";
+    } else if (/myth|legend|folklore|epic poetry|deity|pantheon/i.test(workType)) {
+      prefix = "Mythology: ";
+    } else if (/video game|game/i.test(workType)) {
+      prefix = "Video Game: ";
+    } else if (/comic|manga|graphic novel/i.test(workType)) {
+      prefix = "Comic: ";
+    } else if (/biography|memoir|true story/i.test(workType)) {
+      prefix = "Real-life Event: ";
+    }
+    const creatorStr = (creator && !creator.startsWith("Q")) ? ` by ${creator}` : "";
+    return `${prefix}"${work}"${creatorStr}`;
+  }
+
+  const realEvent = event || subject;
+  if (realEvent && !realEvent.startsWith("Q")) {
+    return `Real-life Event: ${realEvent}`;
+  }
+
+  if (myth && !myth.startsWith("Q")) {
+    return `Mythology: ${myth}`;
+  }
+
+  return null;
 }
 
 // ----------------- Wikidata Engines -----------------
@@ -206,15 +237,26 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   }
 
   const query = `
-    SELECT ?workLabel ?creatorLabel ?workTypeLabel ?eventLabel ?mythLabel ?article WHERE {
+    SELECT ?workLabel ?creatorLabel ?workTypeLabel ?subjectLabel ?eventLabel ?mythLabel ?article WHERE {
       ${subjectPattern}
       OPTIONAL {
         ?ep wdt:P144 ?work .
+        OPTIONAL { ?work rdfs:label ?workLabel filter (lang(?workLabel) = "en") . }
         OPTIONAL { ?work wdt:P31 ?workType . }
         OPTIONAL { { ?work wdt:P50 ?creator . } UNION { ?work wdt:P178 ?creator . } UNION { ?work wdt:P123 ?creator . } }
       }
-      OPTIONAL { ?ep wdt:P793 ?event . }
-      OPTIONAL { ?ep wdt:P941 ?myth . }
+      OPTIONAL { 
+        { ?ep wdt:P921 ?subjItem . } UNION { ?ep wdt:P180 ?subjItem . }
+        ?subjItem rdfs:label ?subjectLabel filter (lang(?subjectLabel) = "en") .
+      }
+      OPTIONAL { 
+        ?ep wdt:P793 ?eventItem . 
+        ?eventItem rdfs:label ?eventLabel filter (lang(?eventLabel) = "en") .
+      }
+      OPTIONAL {
+        ?ep wdt:P941 ?mythItem .
+        ?mythItem rdfs:label ?mythLabel filter (lang(?mythLabel) = "en") .
+      }
       OPTIONAL {
         ?article schema:about ?ep ;
                  schema:isPartOf <https://en.wikipedia.org/> .
@@ -232,30 +274,12 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
     if (!res.ok) return null;
     const json = await res.json();
     const binding = json?.results?.bindings?.[0];
-
-    const work = binding?.workLabel?.value;
-    const creator = binding?.creatorLabel?.value;
-    const workType = binding?.workTypeLabel?.value || "";
-    const event = binding?.eventLabel?.value;
-    const myth = binding?.mythLabel?.value;
-    const article = binding?.article?.value;
-
-    let sourceStr = null;
-
-    if (work && !work.startsWith("Q")) {
-      const prefix = classifyWorkType(workType);
-      const creatorSuffix = (creator && !creator.startsWith("Q")) ? ` (${creator})` : "";
-      sourceStr = `${prefix}"${work}"${creatorSuffix}`;
-    } else if (event && !event.startsWith("Q")) {
-      sourceStr = `Real Event: ${event}`;
-    } else if (myth && !myth.startsWith("Q")) {
-      sourceStr = `Mythology: ${myth}`;
-    }
+    const sourceStr = formatWikidataAdaptation(binding);
 
     if (sourceStr) {
       return {
         adaptedSource: sourceStr,
-        episodeWikiUrl: article || null
+        episodeWikiUrl: binding?.article?.value || null
       };
     }
   } catch (err) {
@@ -275,17 +299,27 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   }
 
   const query = `
-    SELECT ?franchiseLabel ?basedOnLabel ?basedOnTypeLabel ?creatorLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?article ?duration ?editionLabel WHERE {
+    SELECT ?franchiseLabel ?workLabel ?workTypeLabel ?creatorLabel ?subjectLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?article ?duration ?editionLabel WHERE {
       ?item wdt:P345 "${imdbId}".
       OPTIONAL { ?item wdt:P179 ?franchise. }
       OPTIONAL {
-        ?item wdt:P144 ?basedOnItem .
-        ?basedOnItem rdfs:label ?basedOnLabel filter (lang(?basedOnLabel) = "en") .
-        OPTIONAL { ?basedOnItem wdt:P31 ?basedOnType . }
-        OPTIONAL { { ?basedOnItem wdt:P50 ?creator . } UNION { ?basedOnItem wdt:P178 ?creator . } UNION { ?basedOnItem wdt:P123 ?creator . } }
+        ?item wdt:P144 ?work .
+        OPTIONAL { ?work rdfs:label ?workLabel filter (lang(?workLabel) = "en") . }
+        OPTIONAL { ?work wdt:P31 ?workType . }
+        OPTIONAL { { ?work wdt:P50 ?creator . } UNION { ?work wdt:P178 ?creator . } UNION { ?work wdt:P123 ?creator . } }
       }
-      OPTIONAL { ?item wdt:P793 ?event. }
-      OPTIONAL { ?item wdt:P941 ?myth. }
+      OPTIONAL { 
+        { ?item wdt:P921 ?subjItem . } UNION { ?item wdt:P180 ?subjItem . }
+        ?subjItem rdfs:label ?subjectLabel filter (lang(?subjectLabel) = "en") .
+      }
+      OPTIONAL { 
+        ?item wdt:P793 ?eventItem . 
+        ?eventItem rdfs:label ?eventLabel filter (lang(?eventLabel) = "en") .
+      }
+      OPTIONAL {
+        ?item wdt:P941 ?mythItem .
+        ?mythItem rdfs:label ?mythLabel filter (lang(?mythLabel) = "en") .
+      }
       OPTIONAL { ?item wdt:P155 ?follows. }
       OPTIONAL { ?item wdt:P156 ?followedBy. }
       OPTIONAL { ?item wdt:P361 ?partOf. }
@@ -315,27 +349,12 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
 
     const first = bindings[0];
     const franchise = first?.franchiseLabel?.value;
-    let basedOn = first?.basedOnLabel?.value;
-    const basedOnType = first?.basedOnTypeLabel?.value || "";
-    const creator = first?.creatorLabel?.value;
-    const event = first?.eventLabel?.value;
-    const myth = first?.mythLabel?.value;
     const follows = first?.followsLabel?.value;
     const followedBy = first?.followedByLabel?.value;
     const partOf = first?.partOfLabel?.value;
     const wikiUrl = first?.article?.value || defaultWikiUrl;
 
-    if (basedOn && !basedOn.startsWith("Q")) {
-      const prefix = classifyWorkType(basedOnType);
-      const creatorSuffix = (creator && !creator.startsWith("Q")) ? ` by ${creator}` : "";
-      basedOn = `${prefix}${basedOn}${creatorSuffix}`;
-    } else if (event && !event.startsWith("Q")) {
-      basedOn = `Real Event: ${event}`;
-    } else if (myth && !myth.startsWith("Q")) {
-      basedOn = `Mythology: ${myth}`;
-    } else {
-      basedOn = null;
-    }
+    const basedOn = formatWikidataAdaptation(first);
 
     let specialCut = null;
     const theatricalMin = baseTheatricalMinutes || 0;
@@ -346,7 +365,6 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
       if (Number.isNaN(parsedDur) || parsedDur <= 0) continue;
 
       const minutes = parsedDur > 500 ? Math.round(parsedDur / 60) : Math.round(parsedDur);
-
       if (theatricalMin > 0 && minutes >= theatricalMin + 3) {
         const editionName = b.editionLabel?.value && !b.editionLabel.value.startsWith("Q")
           ? b.editionLabel.value
@@ -380,18 +398,28 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
   }
 
   const query = `
-    SELECT ?franchiseLabel ?basedOnLabel ?basedOnTypeLabel ?creatorLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?article
+    SELECT ?franchiseLabel ?workLabel ?workTypeLabel ?creatorLabel ?subjectLabel ?eventLabel ?mythLabel ?followsLabel ?followedByLabel ?partOfLabel ?article
            ?predecessorLabel (YEAR(?origStart) AS ?origStartY) (YEAR(?origEnd) AS ?origEndY) WHERE {
       ?item wdt:P345 "${imdbId}".
       OPTIONAL { ?item wdt:P179 ?franchise. }
       OPTIONAL {
-        ?item wdt:P144 ?basedOnItem .
-        ?basedOnItem rdfs:label ?basedOnLabel filter (lang(?basedOnLabel) = "en") .
-        OPTIONAL { ?basedOnItem wdt:P31 ?basedOnType . }
-        OPTIONAL { { ?basedOnItem wdt:P50 ?creator . } UNION { ?basedOnItem wdt:P178 ?creator . } UNION { ?basedOnItem wdt:P123 ?creator . } }
+        ?item wdt:P144 ?work .
+        OPTIONAL { ?work rdfs:label ?workLabel filter (lang(?workLabel) = "en") . }
+        OPTIONAL { ?work wdt:P31 ?workType . }
+        OPTIONAL { { ?work wdt:P50 ?creator . } UNION { ?work wdt:P178 ?creator . } UNION { ?work wdt:P123 ?creator . } }
       }
-      OPTIONAL { ?item wdt:P793 ?event . }
-      OPTIONAL { ?item wdt:P941 ?myth . }
+      OPTIONAL { 
+        { ?item wdt:P921 ?subjItem . } UNION { ?item wdt:P180 ?subjItem . }
+        ?subjItem rdfs:label ?subjectLabel filter (lang(?subjectLabel) = "en") .
+      }
+      OPTIONAL { 
+        ?item wdt:P793 ?eventItem . 
+        ?eventItem rdfs:label ?eventLabel filter (lang(?eventLabel) = "en") .
+      }
+      OPTIONAL {
+        ?item wdt:P941 ?mythItem .
+        ?mythItem rdfs:label ?mythLabel filter (lang(?mythLabel) = "en") .
+      }
       OPTIONAL { ?item wdt:P155 ?follows. }
       OPTIONAL { ?item wdt:P156 ?followedBy. }
       OPTIONAL { ?item wdt:P361 ?partOf. }
@@ -419,27 +447,12 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
     const binding = json?.results?.bindings?.[0];
 
     const franchise = binding?.franchiseLabel?.value;
-    let basedOn = binding?.basedOnLabel?.value;
-    const basedOnType = binding?.basedOnTypeLabel?.value || "";
-    const creator = binding?.creatorLabel?.value;
-    const event = binding?.eventLabel?.value;
-    const myth = binding?.mythLabel?.value;
     const follows = binding?.followsLabel?.value;
     const followedBy = binding?.followedByLabel?.value;
     const partOf = binding?.partOfLabel?.value;
     const wikiUrl = binding?.article?.value || defaultWikiUrl;
 
-    if (basedOn && !basedOn.startsWith("Q")) {
-      const prefix = classifyWorkType(basedOnType);
-      const creatorSuffix = (creator && !creator.startsWith("Q")) ? ` (${creator})` : "";
-      basedOn = `${prefix}${basedOn}${creatorSuffix}`;
-    } else if (event && !event.startsWith("Q")) {
-      basedOn = `Real Event: ${event}`;
-    } else if (myth && !myth.startsWith("Q")) {
-      basedOn = `Mythology: ${myth}`;
-    } else {
-      basedOn = null;
-    }
+    const basedOn = formatWikidataAdaptation(binding);
 
     let revivalOf = null;
     const predTitle = binding?.predecessorLabel?.value;
@@ -539,15 +552,31 @@ async function fetchTvdbSpecialCut(imdbId, episodeName, season, episode, tvdbKey
 
 // ----------------- Parsing & Formatting -----------------
 
-function extractSourceMaterial(crew = []) {
-  const adaptationPatterns = [
-    /novel/i, /novella/i, /book/i, /comic/i, /graphic novel/i, /character/i,
-    /short story/i, /theatre play|theater play|stage play|play/i, /video game|game/i,
-    /author/i, /story by/i, /memoir/i, /biography/i, /myth/i, /legend/i, /folklore/i,
-    /based on the lives|true story/i
-  ];
-
+function extractSourceMaterial(crew = [], keywords = []) {
   const sources = [];
+
+  // 1. Evaluate TMDB Keywords
+  const kwList = Array.isArray(keywords) ? keywords.map(k => (k.name || "").toLowerCase()) : [];
+  if (kwList.some(k => k.includes("based on true story") || k.includes("based on a true story") || k.includes("real life event") || k.includes("true events"))) {
+    sources.push("Based on real-life events");
+  } else if (kwList.some(k => k.includes("play adaptation") || k.includes("stage play") || k.includes("theatre play"))) {
+    sources.push("Adapted from a Stage Play");
+  } else if (kwList.some(k => k.includes("mythology") || k.includes("greek myth") || k.includes("folklore") || k.includes("legend"))) {
+    sources.push("Based on Mythology/Folklore");
+  }
+
+  // 2. Evaluate Crew Credits
+  const adaptationPatterns = [
+    { pattern: /theatre play|theater play|stage play|^play$/i, label: "Stage Play" },
+    { pattern: /novella/i, label: "Novella" },
+    { pattern: /novel/i, label: "Novel" },
+    { pattern: /book/i, label: "Book" },
+    { pattern: /comic|graphic novel/i, label: "Comic" },
+    { pattern: /video game|game/i, label: "Video Game" },
+    { pattern: /myth|legend|folklore/i, label: "Mythology" },
+    { pattern: /biography|memoir|true story/i, label: "Real-life Events" },
+    { pattern: /characters|author|story by/i, label: "Story" }
+  ];
 
   for (const person of crew) {
     const rawJobs = [];
@@ -557,19 +586,11 @@ function extractSourceMaterial(crew = []) {
     }
 
     for (const jobTitle of rawJobs) {
-      if (adaptationPatterns.some(pattern => pattern.test(jobTitle))) {
-        let cleanJob = jobTitle.replace(/^based\s+on\s+(the\s+)?/i, "").trim();
-
-        // Categorize job titles cleanly
-        if (/theatre play|theater play|stage play|^play$/i.test(cleanJob)) cleanJob = "Stage Play";
-        else if (/novella/i.test(cleanJob)) cleanJob = "Novella";
-        else if (/novel/i.test(cleanJob)) cleanJob = "Novel";
-        else if (/comic/i.test(cleanJob)) cleanJob = "Comic";
-        else if (/biography|memoir|true story/i.test(cleanJob)) cleanJob = "Real-life Events";
-        else if (/myth|legend|folklore/i.test(cleanJob)) cleanJob = "Mythology";
-
-        const formattedJob = cleanJob.charAt(0).toUpperCase() + cleanJob.slice(1);
-        sources.push(`${formattedJob} by ${person.name}`);
+      for (const entry of adaptationPatterns) {
+        if (entry.pattern.test(jobTitle)) {
+          sources.push(`${entry.label} by ${person.name}`);
+          break;
+        }
       }
     }
   }
@@ -580,39 +601,39 @@ function extractSourceMaterial(crew = []) {
 function extractStoryArcFromText(text = "") {
   if (!text) return null;
 
-  // 1. Detect Real Life Events / True Stories
-  const realEventMatch = text.match(/(?:based on|inspired by|chronicles|depicting|adapted from)\s+(?:the\s+)?(?:true\s+(?:events?|story|account)|real[- ]life\s+(?:events?|story|disaster|mission|incident|case)|actual events?)(?:\s+(?:of|surrounding)\s+["'“]?([^"'”.,;]+)["'”]?)?/i);
-  if (realEventMatch) {
-    return realEventMatch[1] ? `Real Event: ${realEventMatch[1].trim()}` : "Based on real-life events";
+  // 1. Real events, true accounts, history
+  const realMatch = text.match(/(?:based on|inspired by|chronicles|depicts?|dramatiz(?:ing|ation of))\s+(?:the\s+)?(?:true\s+(?:story|events?|account)|real[- ]life\s+(?:story|events?|incident|disaster|mission|case)|actual events?)(?:\s+(?:of|surrounding|involving)\s+["'“]?([^"'”.,;]+)["'”]?)?/i);
+  if (realMatch) {
+    return realMatch[1] ? `Real Event: ${realMatch[1].trim()}` : "Based on real-life events";
   }
 
-  // 2. Detect Mythology / Folklore / Epics
-  const mythMatch = text.match(/(?:based on|adapted from|inspired by|retelling of)\s+(?:the\s+)?(?:ancient\s+)?([A-Za-z\s]+?)\s+(?:mythology|myth|legend|folklore|epic|folktale)(?:\s+["'“]([^"'”]+)["'”])?/i);
+  // 2. Stage plays & Broadway
+  const playMatch = text.match(/(?:based on|adapted from)\s+(?:the\s+)?(?:acclaimed\s+|broadway\s+|award[- ]winning\s+)?(?:stage\s+play|theatre\s+play|theater\s+play|play|musical)\s+["'“]([^"'”]+)["'”]/i);
+  if (playMatch && playMatch[1]) {
+    return `Stage Play: "${playMatch[1].trim()}"`;
+  }
+
+  // 3. Novella
+  const novellaMatch = text.match(/(?:based on|adapted from)\s+(?:the\s+)?novella\s+["'“]([^"'”]+)["'”]/i);
+  if (novellaMatch && novellaMatch[1]) {
+    return `Novella: "${novellaMatch[1].trim()}"`;
+  }
+
+  // 4. Mythology & Folklore
+  const mythMatch = text.match(/(?:based on|adapted from|retelling of|inspired by)\s+(?:the\s+)?([A-Za-z\s]+?)\s+(?:mythology|myth|legend|folklore|epic|folktale)(?:\s+["'“]([^"'”]+)["'”])?/i);
   if (mythMatch) {
     const mythType = mythMatch[1].trim();
     const title = mythMatch[2] ? ` ("${mythMatch[2].trim()}")` : "";
     return `Mythology: ${mythType} Legend${title}`;
   }
 
-  // 3. Detect Stage Plays / Theatre
-  const playMatch = text.match(/(?:based on|adapted from)\s+(?:the\s+)?(?:acclaimed\s+|award[- ]winning\s+|broadway\s+|theatrical\s+)?(?:stage\s+play|theatre\s+play|theater\s+play|play)\s+["'“]([^"'”]+)["'”]/i);
-  if (playMatch && playMatch[1]) {
-    return `Stage Play: "${playMatch[1].trim()}"`;
-  }
-
-  // 4. Detect Novella
-  const novellaMatch = text.match(/(?:based on|adapted from)\s+(?:the\s+)?novella\s+["'“]([^"'”]+)["'”]/i);
-  if (novellaMatch && novellaMatch[1]) {
-    return `Novella: "${novellaMatch[1].trim()}"`;
-  }
-
-  // 5. Detect Video Games
+  // 5. Video Games
   const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:hit\s+|acclaimed\s+|popular\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
   if (vgMatch && vgMatch[1]) {
     return `Video Game: ${vgMatch[1].trim()}`;
   }
 
-  // 6. Detect Book / Novel / Comic / Graphic Novel Arcs
+  // 6. Books / Novels / Comics
   const arcMatch = text.match(/(?:based on|adapted from|adapting)\s+(?:the\s+(?:book|novel|comic|graphic novel)\s+)?["'“]([^"'”]+)["'”]/i);
   return arcMatch && arcMatch[1] ? arcMatch[1].trim() : null;
 }
@@ -684,17 +705,17 @@ async function findByImdb(imdbId, creds) {
 async function resolveMovie(rawId, creds) {
   if (rawId.startsWith("tmdb:")) {
     const tmdbId = rawId.replace("tmdb:", "");
-    const movie = await tmdbGet(`/movie/${tmdbId}?append_to_response=credits,release_dates`, creds);
+    const movie = await tmdbGet(`/movie/${tmdbId}?append_to_response=credits,release_dates,keywords`, creds);
     return { movie, imdbId: movie.imdb_id || null };
   }
   if (/^\d+$/.test(rawId)) {
-    const movie = await tmdbGet(`/movie/${rawId}?append_to_response=credits,release_dates`, creds);
+    const movie = await tmdbGet(`/movie/${rawId}?append_to_response=credits,release_dates,keywords`, creds);
     return { movie, imdbId: movie.imdb_id || null };
   }
   if (/^tt\d+$/i.test(rawId)) {
     const found = await findByImdb(rawId, creds);
     if (found.id) {
-      const movie = await tmdbGet(`/movie/${found.id}?append_to_response=credits,release_dates`, creds);
+      const movie = await tmdbGet(`/movie/${found.id}?append_to_response=credits,release_dates,keywords`, creds);
       return { movie, imdbId: rawId };
     }
     throw new Error(`TMDB could not map IMDb ID ${rawId}`);
@@ -706,7 +727,7 @@ async function resolveTvShow(rawId, creds) {
   if (rawId.startsWith("tmdb:")) {
     const id = rawId.replace("tmdb:", "");
     try {
-      const details = await tmdbGet(`/tv/${id}?append_to_response=external_ids,aggregate_credits`, creds);
+      const details = await tmdbGet(`/tv/${id}?append_to_response=external_ids,aggregate_credits,keywords`, creds);
       return { tvId: id, imdbId: details.external_ids?.imdb_id || null, showData: details };
     } catch {
       return { tvId: id, imdbId: null, showData: { name: "TV Series", id } };
@@ -715,7 +736,7 @@ async function resolveTvShow(rawId, creds) {
 
   if (/^\d+$/.test(rawId)) {
     try {
-      const details = await tmdbGet(`/tv/${rawId}?append_to_response=external_ids,aggregate_credits`, creds);
+      const details = await tmdbGet(`/tv/${rawId}?append_to_response=external_ids,aggregate_credits,keywords`, creds);
       return { tvId: rawId, imdbId: details.external_ids?.imdb_id || null, showData: details };
     } catch {
       return { tvId: rawId, imdbId: null, showData: { name: "TV Series", id: rawId } };
@@ -727,7 +748,7 @@ async function resolveTvShow(rawId, creds) {
       const resolvedTvId = KNOWN_IMDB_TO_TMDB[rawId];
       let details = null;
       try {
-        details = await tmdbGet(`/tv/${resolvedTvId}`, creds);
+        details = await tmdbGet(`/tv/${resolvedTvId}?append_to_response=external_ids,aggregate_credits,keywords`, creds);
       } catch {
         details = { name: "Lanterns", id: resolvedTvId };
       }
@@ -738,7 +759,7 @@ async function resolveTvShow(rawId, creds) {
     if (found.id) {
       let details = null;
       try {
-        details = await tmdbGet(`/tv/${found.id}`, creds);
+        details = await tmdbGet(`/tv/${found.id}?append_to_response=external_ids,aggregate_credits,keywords`, creds);
       } catch {
         details = { id: found.id };
       }
@@ -784,7 +805,8 @@ async function getMovieInfo(rawId, creds) {
       specialCut = KNOWN_MOVIE_CUTS[String(movie.id)];
     }
 
-    const sourceMaterial = extractSourceMaterial(movie.credits?.crew || []);
+    const movieKeywords = movie.keywords?.keywords || [];
+    const sourceMaterial = extractSourceMaterial(movie.credits?.crew || [], movieKeywords);
     let franchise = movie.belongs_to_collection ? movie.belongs_to_collection.name : null;
 
     // Check movie overview & tagline for adaptations, plays, novellas, real events, and mythology
@@ -820,7 +842,7 @@ async function getMovieInfo(rawId, creds) {
       theatrical,
       digital,
       specialCut,
-      sourceMaterial,
+      sourceMaterial: [...new Set(sourceMaterial)].slice(0, 2),
       franchise,
       wikiUrl: wiki.wikiUrl
     };
@@ -954,7 +976,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (epArc && !sources.some(s => s.toLowerCase().includes(epArc.toLowerCase()))) {
         sources.push(epArc);
       }
-      const epSources = extractSourceMaterial(epData.credits?.crew || []);
+      const epSources = extractSourceMaterial(epData.credits?.crew || [], []);
       for (const s of epSources) {
         if (!sources.includes(s)) sources.push(s);
       }
@@ -966,27 +988,25 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (seasonArc && !sources.some(s => s.toLowerCase().includes(seasonArc.toLowerCase()))) {
         sources.push(seasonArc);
       }
-      const seasonSources = extractSourceMaterial(seasonData.credits?.crew || []);
+      const seasonSources = extractSourceMaterial(seasonData.credits?.crew || [], []);
       for (const s of seasonSources) {
         if (!sources.includes(s)) sources.push(s);
       }
     }
 
-    // 5. Check Series overview
+    // 5. Check Series overview & series keywords
+    const showKeywords = showData?.keywords?.results || [];
+    const seriesSources = extractSourceMaterial(showData?.aggregate_credits?.crew || [], showKeywords);
+    for (const s of seriesSources) {
+      if (!sources.some(existing => existing.toLowerCase().includes(s.toLowerCase()))) {
+        sources.push(s);
+      }
+    }
+
     if (showData?.overview) {
       const seriesOverviewArc = extractStoryArcFromText(showData.overview);
       if (seriesOverviewArc && !sources.some(s => s.toLowerCase().includes(seriesOverviewArc.toLowerCase()))) {
         sources.push(seriesOverviewArc);
-      }
-    }
-
-    // 6. Fall back to Series-level aggregate credits
-    if (sources.length === 0) {
-      const seriesSources = extractSourceMaterial(showData?.aggregate_credits?.crew || []);
-      for (const s of seriesSources) {
-        if (!sources.some(existing => existing.toLowerCase().includes(s.toLowerCase()))) {
-          sources.push(s);
-        }
       }
     }
 
@@ -1176,7 +1196,7 @@ app.get("/", (_req, res) => {
           <img src="https://thetvdb.com/images/logo.png" alt="TheTVDB Logo" title="TheTVDB" style="filter: brightness(0) invert(1);" />
         </div>
 
-        <p>Displays release dates, theatrical & extended runtimes, episodic & seasonal adaptations (books, plays, real-life events, mythology), revivals, and franchise continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
+        <p>Displays release dates, theatrical & extended runtimes, episodic & seasonal adaptations (books, plays, novellas, real-life events, mythology), revivals, and franchise continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
