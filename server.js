@@ -5,11 +5,15 @@ const PORT = process.env.PORT || 7000;
 const SERVER_TMDB_API_TOKEN = process.env.TMDB_API_TOKEN || "";
 const SERVER_TMDB_API_KEY = process.env.TMDB_API_KEY || "";
 const SERVER_TVDB_API_KEY = process.env.TVDB_API_KEY || "";
+const SERVER_GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const DEFAULT_REGION = (process.env.DEFAULT_REGION || "US").toUpperCase();
 const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 21600000);
 
 const cache = new Map();
 const activeRequests = new Map();
+
+// Gemini Circuit Breaker timestamp (disables calls temporarily on 429 rate limit)
+let geminiDisabledUntil = 0;
 
 // Known TV show ID translations when TMDB /find endpoint is unindexed or lagging
 const KNOWN_IMDB_TO_TMDB = {
@@ -17,7 +21,8 @@ const KNOWN_IMDB_TO_TMDB = {
   "tt2375692":  "49010",  // Black Sails
   "tt3581920":  "100088", // The Last of Us
   "tt12637874": "106379", // Fallout
-  "tt7661390":  "85021"   // Gangs of London
+  "tt7661390":  "85021",  // Gangs of London
+  "tt14261112": "111110"  // Twisted Metal
 };
 
 // Curated dictionary for legendary movie alternate/extended cuts with running times
@@ -46,6 +51,18 @@ const KNOWN_TV_CUTS = {
 
 // Curated backup for notable adaptations / continuity / spin-offs / pre-release titles
 const KNOWN_SERIES_CONTINUITY = {
+  // Twisted Metal (PlayStation Productions)
+  "111110": {
+    franchise: "Twisted Metal Franchise",
+    basedOn: "Video Game: Twisted Metal (PlayStation / Sony Interactive Entertainment)",
+    wikiUrl: "https://en.wikipedia.org/wiki/Twisted_Metal_(TV_series)"
+  },
+  "tt14261112": {
+    franchise: "Twisted Metal Franchise",
+    basedOn: "Video Game: Twisted Metal (PlayStation / Sony Interactive Entertainment)",
+    wikiUrl: "https://en.wikipedia.org/wiki/Twisted_Metal_(TV_series)"
+  },
+
   // Gangs of London (Spin-off of The Getaway video game franchise)
   "85021": {
     franchise: "The Getaway Franchise",
@@ -154,12 +171,14 @@ function getCredentials(configStr) {
   let tmdbToken = SERVER_TMDB_API_TOKEN;
   let tmdbKey = SERVER_TMDB_API_KEY;
   let tvdbKey = SERVER_TVDB_API_KEY;
+  let geminiKey = SERVER_GEMINI_API_KEY;
 
   if (configStr) {
     const decoded = decodeURIComponent(configStr).trim();
     const parts = decoded.split(":");
     const mainTmdb = parts[0] || "";
     if (parts[1]) tvdbKey = parts[1];
+    if (parts[2]) geminiKey = parts[2];
 
     if (mainTmdb.startsWith("eyJ") || mainTmdb.length > 50) {
       tmdbToken = mainTmdb;
@@ -170,7 +189,7 @@ function getCredentials(configStr) {
     }
   }
 
-  return { tmdbToken, tmdbKey, tvdbKey };
+  return { tmdbToken, tmdbKey, tvdbKey, geminiKey };
 }
 
 // ----------------- TMDB Helpers -----------------
@@ -194,6 +213,66 @@ async function tmdbGet(path, creds) {
   try { data = JSON.parse(raw); } catch { data = {}; }
   if (!r.ok) throw new Error(data.status_message || `TMDB HTTP ${r.status}`);
   return data;
+}
+
+// ----------------- Gemini AI Engine (With Fallback) -----------------
+
+async function analyzeMediaWithAI(title, year, overview, mediaType = "series", apiKey) {
+  if (!apiKey || !title) return null;
+
+  // Circuit Breaker: Skip if recently rate-limited (HTTP 429)
+  if (Date.now() < geminiDisabledUntil) {
+    return null;
+  }
+
+  const prompt = `
+You are a film and television archivist. Analyze the following ${mediaType}:
+Title: "${title}"
+Release Year: ${year || "Unknown"}
+Overview: "${overview || ""}"
+
+Respond ONLY with a JSON object (no markdown, no backticks, no code blocks):
+{
+  "basedOn": string or null (Format: 'Video Game: Game Title (Developer/Publisher)', 'Novel: Book Title by Author', 'Stage Play: Play Title by Playwright', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
+  "isRealLifeEvent": string or null (Name of real historical event, disaster, war, or true incident ONLY. If fiction, vampires, supernatural, fantasy, or sci-fi, this MUST be null),
+  "spinOffOf": string or null (Parent series or game if this is a direct spin-off, e.g. 'The Getaway', 'Breaking Bad', 'The Vampire Diaries', otherwise null),
+  "franchise": string or null (Cinematic or universe name if applicable, e.g. 'The Vampire Diaries Universe', 'PlayStation Productions', otherwise null)
+}
+`;
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: "application/json"
+        }
+      })
+    });
+
+    if (res.status === 429) {
+      console.warn(`[Gemini API Rate Limit Reached]: Trip circuit breaker for 5 mins. Falling back to local engines.`);
+      geminiDisabledUntil = Date.now() + 300000; // 5 min cool-off
+      return null;
+    }
+
+    if (!res.ok) {
+      console.warn(`[Gemini HTTP ${res.status}]: Falling back to local engines.`);
+      return null;
+    }
+
+    const data = await res.json();
+    const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!textResponse) return null;
+
+    return JSON.parse(textResponse.trim());
+  } catch (err) {
+    console.warn(`[Gemini Exception for ${title}]: ${err.message}. Using fallback engine.`);
+    return null;
+  }
 }
 
 // ----------------- Source Material & Adaptation Classifier -----------------
@@ -222,14 +301,15 @@ function formatWikidataAdaptation(binding) {
       prefix = "Video Game: ";
     } else if (/comic|manga|graphic novel/i.test(workType)) {
       prefix = "Comic: ";
-    } else if (/biography|memoir|true story/i.test(workType)) {
-      prefix = "Real-life Event: ";
     }
     const creatorStr = (creator && !creator.startsWith("Q")) ? ` by ${creator}` : "";
     return `${prefix}"${work}"${creatorStr}`;
   }
 
-  const realEvent = event || subject;
+  // Guard against fictional/supernatural tropes being flagged as real events
+  const invalidSubjects = /vampire|werewolf|witch|magic|supernatural|zombie|ghost|monster|high school|fiction|superhero/i;
+  const realEvent = event || (subject && !invalidSubjects.test(subject) ? subject : null);
+
   if (realEvent && !realEvent.startsWith("Q")) {
     return `Real-life Event: ${realEvent}`;
   }
@@ -290,7 +370,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return null;
@@ -365,7 +445,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
@@ -471,7 +551,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
     const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.1 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
+      headers: { "User-Agent": "ReleaseInfoAddon/6.2 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
     });
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, spinOffOf: null, wikiUrl: defaultWikiUrl };
@@ -667,9 +747,9 @@ function extractStoryArcFromText(text = "") {
     return { arc: `Mythology: ${mythType} Legend${title}`, spinOff };
   }
 
-  // 5. Video Games
-  const vgMatch = text.match(/(?:based on|adapted from|adaptation of)\s+(?:the\s+)?(?:hit\s+|acclaimed\s+|popular\s+)?video game\s+(?:series\s+|franchise\s+)?["'“]?([^"'”.,;]+)["'”]?/i);
-  if (vgMatch && vgMatch[1]) {
+  // 5. Video Games (including PlayStation/Nintendo/Xbox titles)
+  const vgMatch = text.match(/(?:based on|adapted from|adaptation of|inspired by)?(?:\s+[\w\s&]+)?(?:classic\s+|hit\s+|acclaimed\s+|popular\s+)?(?:video\s+game|playstation(?:\s+game)?|nintendo|xbox|sega)\s+(?:series\s+|franchise\s+)?["'“]?([A-Za-z0-9\s:–-]+?)["'”]?(?:\s+by|\s+from|\.|\,|$)/i);
+  if (vgMatch && vgMatch[1] && !/series|show|movie|film/i.test(vgMatch[1].trim())) {
     return { arc: `Video Game: ${vgMatch[1].trim()}`, spinOff };
   }
 
@@ -857,8 +937,25 @@ async function getMovieInfo(rawId, creds) {
     }
 
     const movieTitle = movie.title || movie.original_title || "";
-    const wiki = await fetchWikidataMovieDetails(imdbId, movieTitle, movie.runtime);
+    const movieYear = (movie.release_date || "").split("-")[0];
 
+    // 1. Try Gemini AI (if key is present and not circuit-broken)
+    if (creds.geminiKey) {
+      const aiData = await analyzeMediaWithAI(movieTitle, movieYear, movie.overview, "movie", creds.geminiKey);
+      if (aiData) {
+        if (!spinOffOf && aiData.spinOffOf) spinOffOf = aiData.spinOffOf;
+        if (!franchise && aiData.franchise) franchise = aiData.franchise;
+        if (aiData.basedOn && !sourceMaterial.some(s => s.toLowerCase().includes(aiData.basedOn.toLowerCase()))) {
+          sourceMaterial.unshift(aiData.basedOn);
+        }
+        if (aiData.isRealLifeEvent && !sourceMaterial.some(s => s.toLowerCase().includes(aiData.isRealLifeEvent.toLowerCase()))) {
+          sourceMaterial.unshift(`Real-life Event: ${aiData.isRealLifeEvent}`);
+        }
+      }
+    }
+
+    // 2. Query Wikidata (Serves as primary or fallback)
+    const wiki = await fetchWikidataMovieDetails(imdbId, movieTitle, movie.runtime);
     if (wiki) {
       if (!franchise && wiki.franchise) franchise = wiki.franchise;
       if (!spinOffOf && wiki.spinOffOf) spinOffOf = wiki.spinOffOf;
@@ -1063,10 +1160,26 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     let franchise = knownMatch?.franchise || null;
     let revivalOf = knownMatch?.revivalOf || null;
-
     const showTitle = showData?.name || showData?.original_name || "";
-    const wiki = await fetchWikidataDetails(imdbId, showTitle);
+    const showYear = (epData?.air_date || showData?.first_air_date || "").split("-")[0];
 
+    // 6. Gemini AI analysis (Runs if key is present and circuit breaker hasn't tripped)
+    if (creds.geminiKey) {
+      const aiData = await analyzeMediaWithAI(showTitle, showYear, showData?.overview, "series", creds.geminiKey);
+      if (aiData) {
+        if (!spinOffOf && aiData.spinOffOf) spinOffOf = aiData.spinOffOf;
+        if (!franchise && aiData.franchise) franchise = aiData.franchise;
+        if (aiData.basedOn && !sources.some(s => s.toLowerCase().includes(aiData.basedOn.toLowerCase()))) {
+          sources.unshift(aiData.basedOn);
+        }
+        if (aiData.isRealLifeEvent && !sources.some(s => s.toLowerCase().includes(aiData.isRealLifeEvent.toLowerCase()))) {
+          sources.unshift(`Real-life Event: ${aiData.isRealLifeEvent}`);
+        }
+      }
+    }
+
+    // 7. Wikidata Details (Runs as primary metadata source and seamless fallback)
+    const wiki = await fetchWikidataDetails(imdbId, showTitle);
     if (wiki) {
       if (!franchise && wiki.franchise) {
         franchise = wiki.franchise.toLowerCase().includes("franchise") || wiki.franchise.toLowerCase().includes("universe")
@@ -1097,8 +1210,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     if (!revivalOf && /^scrubs/i.test(showTitle) && showTitle.toLowerCase() !== "scrubs (2001)") {
-      const releaseYear = (epData?.air_date || showData?.first_air_date || "").split("-")[0];
-      if (releaseYear && parseInt(releaseYear, 10) >= 2024) {
+      if (showYear && parseInt(showYear, 10) >= 2024) {
         revivalOf = "Revival of Scrubs (2001–2010)";
         if (!franchise) franchise = "Scrubs Universe";
       }
@@ -1151,7 +1263,7 @@ function streamMovie(info) {
   if (info.specialCut) {
     const name = info.specialCut.editionName || "Extended Cut";
     const runtime = info.specialCut.runtime ? ` [Running Time: ${info.specialCut.runtime}]` : "";
-    lines.push(`✂️️ ${name}${runtime}`);
+    lines.push(`✂️ ${name}${runtime}`);
   }
 
   if (info.spinOffOf) {
@@ -1222,7 +1334,7 @@ function streamEpisode(info) {
   ];
 }
 
-// HTML Configuration UI with TMDB & TVDB Logos
+// HTML Configuration UI with TMDB, TVDB & Gemini input
 app.get("/", (_req, res) => {
   res.type("html").send(`
     <!DOCTYPE html>
@@ -1259,13 +1371,16 @@ app.get("/", (_req, res) => {
           <img src="https://thetvdb.com/images/logo.png" alt="TheTVDB Logo" title="TheTVDB" style="filter: brightness(0) invert(1);" />
         </div>
 
-        <p>Displays release dates, theatrical & extended runtimes, episodic & seasonal adaptations (books, plays, real-life events, mythology), spin-offs, revivals, and franchise continuity in Nuvio and Stremio. Clicking cards opens Wikipedia.</p>
+        <p>Displays release dates, runtimes, episodic & seasonal adaptations (books, plays, real-life events, games), spin-offs, and franchise continuity powered by AI and Wikidata fallbacks.</p>
         
         <label for="tmdb">TheMovieDB API Read Token or API Key (Required)</label>
         <input type="text" id="tmdb" placeholder="eyJhbGciOiJIUzI1NiJ9... or API Key" autocomplete="off" />
 
         <label for="tvdb">TheTVDB v4 Project API Key (Optional for extra TV cuts)</label>
         <input type="text" id="tvdb" placeholder="e.g. 12345678-abcd-ef01-2345-6789abcdef01" autocomplete="off" />
+
+        <label for="gemini">Google Gemini API Key (Optional for accurate adaptation & spin-off detection)</label>
+        <input type="text" id="gemini" placeholder="AIzaSy..." autocomplete="off" />
 
         <button class="btn-primary" onclick="generateManifest()">Generate Manifest URL</button>
         <div class="result" id="resultBlock">
@@ -1275,17 +1390,19 @@ app.get("/", (_req, res) => {
         </div>
 
         <div class="attribution-box">
-          Metadata provided by <strong>The Movie Database (TMDB)</strong> and <strong>TheTVDB</strong>. This product uses the TMDB and TVDB APIs but is not endorsed or certified by TMDB or TVDB.
+          Metadata provided by <strong>The Movie Database (TMDB)</strong>, <strong>TheTVDB</strong>, <strong>Wikidata</strong>, and <strong>Google Gemini</strong>.
         </div>
       </div>
       <script>
         function generateManifest() {
           const tmdb = document.getElementById("tmdb").value.trim();
           const tvdb = document.getElementById("tvdb").value.trim();
+          const gemini = document.getElementById("gemini").value.trim();
           if (!tmdb) return alert("Please enter a valid TMDB Token or Key");
 
           let configVal = tmdb;
-          if (tvdb) configVal += ":" + tvdb;
+          if (tvdb || gemini) configVal += ":" + tvdb;
+          if (gemini) configVal += ":" + gemini;
 
           const encoded = encodeURIComponent(configVal);
           const url = window.location.origin + "/" + encoded + "/manifest.json";
@@ -1313,14 +1430,15 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "6.1.0",
+  version: "6.2.0",
+  geminiCircuitBreakerActive: Date.now() < geminiDisabledUntil,
   defaultRegion: DEFAULT_REGION
 }));
 
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.1.0",
+    version: "6.2.0",
     name: "Release Info",
     description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/novellas/plays/mythology/real events), spin-offs, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
