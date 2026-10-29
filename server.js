@@ -1,4 +1,5 @@
 const express = require("express");
+const fs = require("fs");
 
 const app = express();
 const PORT = process.env.PORT || 7000;
@@ -194,6 +195,12 @@ const KNOWN_SERIES_CONTINUITY = {
 
 let tvdbJwtToken = null;
 let tvdbTokenExpiresAt = 0;
+
+// Never let the app/browser cache responses, so a redeployed server.js is picked up immediately
+app.use((req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  next();
+});
 
 // Global CORS Middleware
 app.use((req, res, next) => {
@@ -407,6 +414,7 @@ Year: ${year || "Unknown"}
 Overview: "${overview || ""}"
 
 Only state facts you are confident about; use null when unsure.
+Do NOT set relationType just because the title belongs to a franchise or adapts a book/game/comic. "revival" = a new run of a show that ended years earlier; "reboot"/"remake" = a new version of an earlier film/show; most titles are none of these and must be null.
 Respond strictly with a JSON object (no markdown, no backticks):
 {
   "basedOn": string or null (Format: 'Video Game: Title (Dev)', 'Novel: Title by Author', 'Short Story: Title by Author', 'Comic: Title by Writer & Artist (Publisher)', 'Stage Play: Title by Author', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
@@ -726,7 +734,7 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
   }
 }
 
-async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
+async function fetchWikidataDetails(imdbId, fallbackTitle = "", showStartYear = null) {
   const defaultWikiUrl = fallbackTitle
     ? `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(fallbackTitle)}`
     : "https://en.wikipedia.org/";
@@ -767,7 +775,8 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
       OPTIONAL { ?item wdt:P156 ?followedBy. }
       OPTIONAL { ?item wdt:P361 ?partOf. }
       OPTIONAL {
-        { ?item wdt:P155 ?predecessor. } UNION { ?item wdt:P144 ?predecessor. }
+        ?item wdt:P155 ?predecessor.
+        ?predecessor wdt:P31/wdt:P279* wd:Q5398426 .
         OPTIONAL { ?predecessor wdt:P580 ?origStart. }
         OPTIONAL { ?predecessor wdt:P582 ?origEnd. }
       }
@@ -801,7 +810,10 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
     const startY = binding?.origStartY?.value;
     const endY = binding?.origEndY?.value;
 
-    if (predTitle && !predTitle.startsWith("Q")) {
+    // A revival = new show continuing an OLDER series that ended at least 3 years before this one began.
+    // (A normal sequel series, or a show based on a book, is NOT a revival.)
+    const gapOk = endY && showStartYear && (Number(showStartYear) - Number(endY) >= 3);
+    if (predTitle && !predTitle.startsWith("Q") && gapOk) {
       const yearRange = startY && endY ? ` (${startY}–${endY})` : (startY ? ` (${startY})` : "");
       revivalOf = `Revival of ${predTitle}${yearRange}`;
     }
@@ -1200,7 +1212,6 @@ async function getMovieInfo(rawId, creds) {
       // For films, "based on another film" in Wikidata means a remake
       if (wiki.spinOffOf) addUnique(relations, `Remake of ${wiki.spinOffOf}`);
       if (wiki.follows) addUnique(relations, `Sequel to ${wiki.follows}`);
-      if (wiki.followedBy) addUnique(relations, `Followed by ${wiki.followedBy}`);
       if (wiki.basedOn && !wiki.spinOffOf && !sourceMaterial.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sourceMaterial.unshift(wiki.basedOn);
       }
@@ -1446,7 +1457,8 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     // 7. Wikidata Details (Primary or fallback)
-    const wiki = await fetchWikidataDetails(imdbId, showTitle);
+    const showStartYear = parseInt((showData?.first_air_date || "").split("-")[0], 10) || null;
+    const wiki = await fetchWikidataDetails(imdbId, showTitle, showStartYear);
     if (wiki) {
       if (!franchise && wiki.franchise) {
         franchise = wiki.franchise.toLowerCase().includes("franchise") || wiki.franchise.toLowerCase().includes("universe")
@@ -1458,8 +1470,8 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (wiki.basedOn && !sources.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sources.unshift(wiki.basedOn);
       }
-      if (wiki.follows && !revivalOf) addUnique(wikiRelations, `Continuation of ${wiki.follows}`);
-      if (wiki.followedBy) addUnique(wikiRelations, `Followed by ${wiki.followedBy}`);
+      // Sequel series (Wikidata "follows"); a long-gap revival is handled separately above
+      if (wiki.follows && !revivalOf) addUnique(wikiRelations, `Sequel to ${wiki.follows}`);
     }
 
     // Heuristic fallbacks for titles containing specific keywords
@@ -1493,7 +1505,10 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     const relations = [];
     if (revivalOf) addUnique(relations, revivalOf);
-    if (spinOffOf) addUnique(relations, `Spin-off of ${spinOffOf}`);
+    // Show spin-off unless the AI already classified this as a reboot/remake/revival/spin-off
+    if (spinOffOf && !aiRelations.some(r => /^(Spin-off|Reboot|Remake|Revival)/i.test(r))) {
+      addUnique(relations, `Spin-off of ${spinOffOf}`);
+    }
     aiRelations.forEach(r => addUnique(relations, r));
     wikiRelations.forEach(r => addUnique(relations, r));
 
@@ -1821,10 +1836,22 @@ app.get("/health", (_req, res) => res.json({
   defaultRegion: DEFAULT_REGION
 }));
 
+// Version changes automatically whenever server.js changes, so Stremio/Nuvio see the update
+let ADDON_VERSION = "6.5.0";
+try {
+  ADDON_VERSION = `6.5.${Math.floor(fs.statSync(__filename).mtimeMs / 60000)}`;
+} catch {
+  // keep default
+}
+
+function sendStreams(res, streams) {
+  return res.json({ streams, cacheMaxAge: 0, staleRevalidate: 0, staleError: 0 });
+}
+
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.5.0",
+    version: ADDON_VERSION,
     name: "Release Info",
     description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/novellas/plays/mythology/real events), spin-offs, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
@@ -1867,7 +1894,7 @@ async function handleStream(req, res) {
       }
 
       const info = await getMovieInfo(rawId, creds);
-      return res.json({ streams: streamMovie(info) });
+      return sendStreams(res, streamMovie(info));
     }
 
     if (type === "series") {
@@ -1887,7 +1914,7 @@ async function handleStream(req, res) {
       }
 
       const info = await getEpisodeInfo(seriesRawId, season, episode, creds);
-      return res.json({ streams: streamEpisode(info) });
+      return sendStreams(res, streamEpisode(info));
     }
   } catch (e) {
     console.error(`[${type}:${id}] ${e.message}`);
