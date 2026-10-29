@@ -304,6 +304,72 @@ async function findWikipediaUrl(title, year, kind) {
   return found;
 }
 
+// ----- Wikipedia infobox "based on" reader (works for brand-new titles Wikidata/TMDB don't know yet) -----
+const wikiSourceCache = new Map();
+
+function cleanWikiText(t) {
+  return String(t || "")
+    .replace(/<ref[^>]*\/>/g, "")
+    .replace(/<ref[\s\S]*?<\/ref>/g, "")
+    .replace(/\[\[(?:[^\]|]*\|)?([^\]]+)\]\]/g, "$1")
+    .replace(/'{2,}/g, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseWikitextBasedOn(wt) {
+  const lineMatch = String(wt || "").match(/\|\s*based on\s*=\s*(.+)/i);
+  if (!lineMatch) return null;
+  const line = cleanWikiText(lineMatch[1]);
+
+  let title = null;
+  let author = null;
+  const tpl = line.match(/\{\{\s*based on\s*\|([^|}]*)\|?([^}]*)\}\}/i);
+  if (tpl) {
+    title = tpl[1].trim();
+    author = tpl[2].split("|").map(x => x.trim()).filter(Boolean).join(" & ") || null;
+  } else {
+    const plain = line.replace(/\{\{|\}\}/g, "").trim();
+    const by = plain.match(/^(.+?)\s+by\s+(.+)$/i);
+    if (by) { title = by[1].trim(); author = by[2].trim(); }
+    else if (plain) title = plain;
+  }
+  if (!title) return null;
+
+  // Work out what kind of source it is from the article's opening text
+  const lead = cleanWikiText(wt);
+  const typeMatch = lead.match(/based on[^.]{0,100}?\b(stage play|play|short story|novella|novel|comic book series|comic book|comic|graphic novel|manga|video game|memoir|book)\b/i);
+  const typeMap = {
+    "stage play": "Stage Play", "play": "Stage Play", "short story": "Short Story", "novella": "Novella",
+    "novel": "Novel", "comic book series": "Comic", "comic book": "Comic", "comic": "Comic",
+    "graphic novel": "Comic", "manga": "Comic", "video game": "Video Game", "memoir": "Memoir", "book": "Book"
+  };
+  const label = typeMatch ? typeMap[typeMatch[1].toLowerCase()] : null;
+  return `${label || "Based on"}: "${title}"${author ? ` by ${author}` : ""}`;
+}
+
+async function fetchWikipediaSource(wikiUrl) {
+  const m = String(wikiUrl || "").match(/^https:\/\/en\.wikipedia\.org\/wiki\/([^?#]+)/);
+  if (!m || /^Special:/i.test(m[1])) return null;
+  const title = decodeURIComponent(m[1]).replace(/_/g, " ");
+  if (wikiSourceCache.has(title)) return wikiSourceCache.get(title);
+
+  let result = null;
+  try {
+    const u = `https://en.wikipedia.org/w/api.php?action=parse&format=json&prop=wikitext&section=0&redirects=1&page=${encodeURIComponent(title)}`;
+    const r = await fetchT(u, { headers: WIKI_UA }, 8000);
+    if (r.ok) {
+      const j = await r.json();
+      result = parseWikitextBasedOn(j?.parse?.wikitext?.["*"] || "");
+    }
+  } catch {
+    // ignore, no source found
+  }
+  wikiSourceCache.set(title, result);
+  return result;
+}
+
 function addUnique(list, text) {
   if (!text) return;
   const t = String(text).trim();
@@ -343,7 +409,7 @@ Overview: "${overview || ""}"
 Only state facts you are confident about; use null when unsure.
 Respond strictly with a JSON object (no markdown, no backticks):
 {
-  "basedOn": string or null (Format: 'Video Game: Title (Dev)', 'Novel: Title by Author', 'Comic: Title by Writer & Artist (Publisher)', 'Stage Play: Title by Author', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
+  "basedOn": string or null (Format: 'Video Game: Title (Dev)', 'Novel: Title by Author', 'Short Story: Title by Author', 'Comic: Title by Writer & Artist (Publisher)', 'Stage Play: Title by Author', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
   "isRealLifeEvent": string or null (Name of real historical event, disaster, war, or true incident ONLY. If fiction, vampires, supernatural, fantasy, or sci-fi, this MUST be null),
   "spinOffOf": string or null (Parent series or game if direct spin-off, e.g. 'The Getaway', 'Breaking Bad', 'The Vampire Diaries', otherwise null),
   "franchise": string or null (Cinematic or universe name if applicable, e.g. 'The Vampire Diaries Universe', 'PlayStation Productions', otherwise null),
@@ -457,6 +523,8 @@ function formatWikidataAdaptation(binding) {
     let prefix = "Based on: ";
     if (/theatre|theater|play|stage|broadway|drama|opera/i.test(workType)) {
       prefix = "Stage Play: ";
+    } else if (/short story/i.test(workType)) {
+      prefix = "Short Story: ";
     } else if (/novella/i.test(workType)) {
       prefix = "Novella: ";
     } else if (/novel|book|literary/i.test(workType)) {
@@ -843,6 +911,7 @@ function extractSourceMaterial(crew = [], keywords = []) {
   // 2. Evaluate Crew Credits
   const adaptationPatterns = [
     { pattern: /theatre play|theater play|stage play|^play$/i, label: "Stage Play" },
+    { pattern: /short story/i, label: "Short Story" },
     { pattern: /novella/i, label: "Novella" },
     { pattern: /novel/i, label: "Novel" },
     { pattern: /book/i, label: "Book" },
@@ -1149,6 +1218,12 @@ async function getMovieInfo(rawId, creds) {
       wikiUrl = (await findWikipediaUrl(movieTitle, movieYear, "movie")) || wikiUrl;
     }
 
+    // Wikipedia infobox fallback for the source work (fixes new releases)
+    if (!sourceMaterial.some(s => /"/.test(s))) {
+      const wikiSrc = await fetchWikipediaSource(wikiUrl);
+      if (wikiSrc) sourceMaterial.unshift(wikiSrc);
+    }
+
     const value = {
       type: "movie",
       rawId,
@@ -1408,6 +1483,12 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       finalWikiUrl = (await findWikipediaUrl(showTitle, showYear, "series"))
         || finalWikiUrl
         || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`;
+    }
+
+    // Wikipedia infobox fallback for the source work
+    if (!sources.some(s => /"/.test(s))) {
+      const wikiSrc = await fetchWikipediaSource(finalWikiUrl);
+      if (wikiSrc) sources.unshift(wikiSrc);
     }
 
     const relations = [];
