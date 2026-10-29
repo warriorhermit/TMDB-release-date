@@ -15,6 +15,11 @@ app.use(express.json());
 const cache = new Map();
 const activeRequests = new Map();
 
+function cacheSet(key, value) {
+  if (cache.size > 2000) cache.delete(cache.keys().next().value);
+  cache.set(key, { value, expires: Date.now() + CACHE_TTL_MS });
+}
+
 // Gemini Circuit Breaker timestamp (disables calls temporarily on 429 rate limit)
 let geminiDisabledUntil = 0;
 
@@ -50,6 +55,35 @@ const KNOWN_TV_CUTS = {
   "1972:3:9":  { editionName: "Extended Cut", runtime: "1h 10m" }, // BSG Unfinished Business
   "1972:4:18": { editionName: "Extended Cut", runtime: "1h 07m" }, // BSG Islanded in a Stream of Stars
   "1972:4:20": { editionName: "Extended Finale", runtime: "2h 32m" } // BSG Daybreak
+};
+
+// Curated per-episode / per-season source material. Keys: "tmdbTvId:season:episode" (most specific)
+// or "tmdbTvId:season". Episode entries show first, then season entries, then series-level sources.
+// Add your own lines here - TMDB TV IDs are in the themoviedb.org URL of the show.
+const KNOWN_EPISODE_SOURCES = {
+  // Game of Thrones (1399): seasons follow A Song of Ice and Fire
+  "1399:1": 'Novel: "A Game of Thrones" by George R. R. Martin',
+  "1399:2": 'Novel: "A Clash of Kings" by George R. R. Martin',
+  "1399:3": 'Novel: "A Storm of Swords" (part 1) by George R. R. Martin',
+  "1399:4": 'Novel: "A Storm of Swords" (part 2) by George R. R. Martin',
+
+  // Outlander (56570): one novel per season
+  "56570:1": 'Novel: "Outlander" by Diana Gabaldon',
+  "56570:2": 'Novel: "Dragonfly in Amber" by Diana Gabaldon',
+  "56570:3": 'Novel: "Voyager" by Diana Gabaldon',
+  "56570:4": 'Novel: "Drums of Autumn" by Diana Gabaldon',
+  "56570:5": 'Novel: "The Fiery Cross" by Diana Gabaldon',
+  "56570:6": 'Novel: "A Breath of Snow and Ashes" by Diana Gabaldon',
+  "56570:7": 'Novel: "An Echo in the Bone" by Diana Gabaldon',
+
+  // Sherlock (19885): modern updates of individual Conan Doyle stories
+  "19885:1:1": 'Novel: "A Study in Scarlet" by Arthur Conan Doyle',
+  "19885:1:3": 'Short Story: "The Bruce-Partington Plans" by Arthur Conan Doyle',
+  "19885:2:1": 'Short Story: "A Scandal in Bohemia" by Arthur Conan Doyle',
+  "19885:2:2": 'Novel: "The Hound of the Baskervilles" by Arthur Conan Doyle',
+  "19885:2:3": 'Short Story: "The Final Problem" by Arthur Conan Doyle',
+  "19885:3:1": 'Short Story: "The Adventure of the Empty House" by Arthur Conan Doyle',
+  "19885:3:3": 'Short Story: "His Last Vow" by Arthur Conan Doyle'
 };
 
 // Curated backup for notable adaptations / continuity / spin-offs / pre-release titles
@@ -218,6 +252,82 @@ async function tmdbGet(path, creds) {
   return data;
 }
 
+// ----------------- Generic Helpers (timeout, Wikipedia lookup, relations) -----------------
+
+const WIKI_UA = { "User-Agent": "ReleaseInfoAddon/6.5 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" };
+
+async function fetchT(url, options = {}, ms = 9000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const wikiCache = new Map();
+
+function normTitle(s) {
+  return String(s || "").toLowerCase().replace(/&/g, "and").replace(/[^a-z0-9]/g, "");
+}
+
+// Finds the real English Wikipedia article so clicking the stream opens it directly
+async function findWikipediaUrl(title, year, kind) {
+  if (!title) return null;
+  const key = `${kind}:${title}:${year || ""}`;
+  if (wikiCache.has(key)) return wikiCache.get(key);
+
+  const hint = kind === "movie" ? "film" : "TV series";
+  const queries = [`${title} ${year || ""} ${hint}`.trim(), `${title} ${hint}`];
+  let found = null;
+
+  for (const q of queries) {
+    try {
+      const u = `https://en.wikipedia.org/w/api.php?action=query&list=search&srlimit=5&format=json&srsearch=${encodeURIComponent(q)}`;
+      const r = await fetchT(u, { headers: WIKI_UA }, 6000);
+      if (!r.ok) continue;
+      const j = await r.json();
+      const hits = j?.query?.search || [];
+      const want = normTitle(title);
+      const hit = hits.find(h => normTitle(h.title).startsWith(want) && !/disambiguation/i.test(h.title));
+      if (hit) {
+        found = `https://en.wikipedia.org/wiki/${encodeURIComponent(hit.title.replace(/ /g, "_"))}`;
+        break;
+      }
+    } catch {
+      // try next query
+    }
+  }
+
+  wikiCache.set(key, found);
+  return found;
+}
+
+function addUnique(list, text) {
+  if (!text) return;
+  const t = String(text).trim();
+  if (!t) return;
+  if (!list.some(x => x.toLowerCase() === t.toLowerCase())) list.push(t);
+}
+
+// Turns an AI/Wikidata relation into a display line
+function relationLine(type, related) {
+  if (!type || !related) return null;
+  const map = {
+    "sequel": "Sequel to",
+    "prequel": "Prequel to",
+    "reboot": "Reboot of",
+    "remake": "Remake of",
+    "revival": "Revival of",
+    "spin-off": "Spin-off of",
+    "spinoff": "Spin-off of",
+    "continuation": "Continuation of"
+  };
+  const label = map[String(type).toLowerCase().trim()];
+  return label ? `${label} ${related}` : null;
+}
+
 // ----------------- Gemini AI Engines (With Fallback) -----------------
 
 async function analyzeMediaWithAI(title, year, overview, mediaType = "movie", apiKey) {
@@ -230,12 +340,15 @@ Title: "${title}"
 Year: ${year || "Unknown"}
 Overview: "${overview || ""}"
 
+Only state facts you are confident about; use null when unsure.
 Respond strictly with a JSON object (no markdown, no backticks):
 {
-  "basedOn": string or null (Format: 'Video Game: Title (Dev)', 'Novel: Title by Author', 'Stage Play: Title by Author', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
+  "basedOn": string or null (Format: 'Video Game: Title (Dev)', 'Novel: Title by Author', 'Comic: Title by Writer & Artist (Publisher)', 'Stage Play: Title by Author', 'Novella: Title by Author', 'Mythology: Culture Legend of Figure', or null if original fiction),
   "isRealLifeEvent": string or null (Name of real historical event, disaster, war, or true incident ONLY. If fiction, vampires, supernatural, fantasy, or sci-fi, this MUST be null),
   "spinOffOf": string or null (Parent series or game if direct spin-off, e.g. 'The Getaway', 'Breaking Bad', 'The Vampire Diaries', otherwise null),
   "franchise": string or null (Cinematic or universe name if applicable, e.g. 'The Vampire Diaries Universe', 'PlayStation Productions', otherwise null),
+  "relationType": string or null (ONLY if this title is one of: "sequel", "prequel", "reboot", "remake", "revival", "spin-off"; otherwise null. A first/original entry is null),
+  "relatedTitle": string or null (Title, with year if helpful, of the work that relationType refers to, e.g. 'Scrubs (2001)'; null if relationType is null),
   "specialCut": {
     "editionName": string or null (e.g. "Director's Cut", "Extended Edition", "The Final Cut", "Special Edition", or null if none),
     "runtime": string or null (Formatted runtime like "3h 14m", "2h 45m", or null if unknown)
@@ -244,7 +357,7 @@ Respond strictly with a JSON object (no markdown, no backticks):
 `;
 
   try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    const res = await fetchT(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -297,7 +410,7 @@ Respond strictly with a JSON object (no markdown, no backticks):
 `;
 
   try {
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+    const res = await fetchT(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -421,9 +534,7 @@ async function fetchWikidataEpisodeAdaptation(seriesImdbId, season, episode, epI
 
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
-    });
+    const res = await fetchT(url, { headers: WIKI_UA }, 12000);
 
     if (!res.ok) return null;
     const json = await res.json();
@@ -475,7 +586,8 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
         ?mythItem rdfs:label ?mythLabel filter (lang(?mythLabel) = "en") .
       }
       OPTIONAL {
-        { ?item wdt:P8345 ?spinItem . } UNION { ?item wdt:P144 ?spinItem . ?spinItem wdt:P31/wdt:P279* wd:Q11424 . }
+        ?item wdt:P144 ?spinItem .
+        ?spinItem wdt:P31/wdt:P279* wd:Q11424 .
         ?spinItem rdfs:label ?spinOffLabel filter (lang(?spinOffLabel) = "en") .
       }
       OPTIONAL { ?item wdt:P155 ?follows. }
@@ -491,14 +603,12 @@ async function fetchWikidataMovieDetails(imdbId, fallbackTitle = "", baseTheatri
                  schema:isPartOf <https://en.wikipedia.org/> .
       }
       SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
-    }
+    } LIMIT 40
   `;
 
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
-    });
+    const res = await fetchT(url, { headers: WIKI_UA }, 12000);
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, spinOffOf: null, specialCut: null, wikiUrl: defaultWikiUrl };
     const json = await res.json();
@@ -581,7 +691,8 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
         ?mythItem rdfs:label ?mythLabel filter (lang(?mythLabel) = "en") .
       }
       OPTIONAL {
-        { ?item wdt:P8345 ?spinItem . } UNION { ?item wdt:P144 ?spinItem . ?spinItem wdt:P31/wdt:P279* wd:Q5398426 . }
+        ?item wdt:P144 ?spinItem .
+        ?spinItem wdt:P31/wdt:P279* wd:Q5398426 .
         ?spinItem rdfs:label ?spinOffLabel filter (lang(?spinOffLabel) = "en") .
       }
       OPTIONAL { ?item wdt:P155 ?follows. }
@@ -602,9 +713,7 @@ async function fetchWikidataDetails(imdbId, fallbackTitle = "") {
 
   try {
     const url = `https://query.wikidata.org/sparql?query=${encodeURIComponent(query)}&format=json`;
-    const res = await fetch(url, {
-      headers: { "User-Agent": "ReleaseInfoAddon/6.4 (https://github.com/warriorhermit/TMDB-release-date-v2.0)" }
-    });
+    const res = await fetchT(url, { headers: WIKI_UA }, 12000);
 
     if (!res.ok) return { franchise: null, basedOn: null, follows: null, followedBy: null, revivalOf: null, spinOffOf: null, wikiUrl: defaultWikiUrl };
     const json = await res.json();
@@ -886,7 +995,7 @@ async function resolveMovie(rawId, creds) {
   }
   if (/^tt\d+$/i.test(rawId)) {
     const found = await findByImdb(rawId, creds);
-    if (found.id) {
+    if (found.id && found.type === "movie") {
       const movie = await tmdbGet(`/movie/${found.id}?append_to_response=credits,release_dates,keywords`, creds);
       return { movie, imdbId: rawId };
     }
@@ -954,7 +1063,8 @@ async function getMovieInfo(rawId, creds) {
     const { movie, imdbId } = await resolveMovie(rawId, creds);
     const countries = movie.release_dates?.results || [];
 
-    const theatrical = chooseRelease(countries, 3);
+    // Theatrical: wide release, else limited, else premiere. Digital: digital release only.
+    const theatrical = chooseRelease(countries, 3) || chooseRelease(countries, 2) || chooseRelease(countries, 1);
     const digital = chooseRelease(countries, 4);
     const theatricalRuntime = formatMinutes(movie.runtime);
 
@@ -965,7 +1075,7 @@ async function getMovieInfo(rawId, creds) {
         if (rel.note && editionPattern.test(rel.note)) {
           const match = rel.note.match(/(\d+)\s*(?:min|mins|m\b)/i);
           const runtime = match ? formatMinutes(parseInt(match[1], 10)) : null;
-          const editionName = rel.note.replace(/\(?\d+\s*(?:min\vert{}mins\vert{}m\b)\)?/i, "").trim();
+          const editionName = rel.note.replace(/\(?\s*\d+\s*(?:mins?|m\b)\s*\)?/i, "").replace(/[-–,:]\s*$/, "").trim() || "Extended Cut";
           specialCut = { editionName, runtime };
           break;
         }
@@ -980,6 +1090,7 @@ async function getMovieInfo(rawId, creds) {
     const movieKeywords = movie.keywords?.keywords || [];
     const sourceMaterial = extractSourceMaterial(movie.credits?.crew || [], movieKeywords);
     let franchise = movie.belongs_to_collection ? movie.belongs_to_collection.name : null;
+    const relations = [];
 
     let spinOffOf = null;
     const parsedText = extractStoryArcFromText(`${movie.overview || ""} ${movie.tagline || ""}`);
@@ -997,6 +1108,7 @@ async function getMovieInfo(rawId, creds) {
       if (aiData) {
         if (!spinOffOf && aiData.spinOffOf) spinOffOf = aiData.spinOffOf;
         if (!franchise && aiData.franchise) franchise = aiData.franchise;
+        addUnique(relations, relationLine(aiData.relationType, aiData.relatedTitle));
         if (aiData.basedOn && !sourceMaterial.some(s => s.toLowerCase().includes(aiData.basedOn.toLowerCase()))) {
           sourceMaterial.unshift(aiData.basedOn);
         }
@@ -1016,18 +1128,25 @@ async function getMovieInfo(rawId, creds) {
     const wiki = await fetchWikidataMovieDetails(imdbId, movieTitle, movie.runtime);
     if (wiki) {
       if (!franchise && wiki.franchise) franchise = wiki.franchise;
-      if (!spinOffOf && wiki.spinOffOf) spinOffOf = wiki.spinOffOf;
-      if (wiki.basedOn && !sourceMaterial.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
+      // For films, "based on another film" in Wikidata means a remake
+      if (wiki.spinOffOf) addUnique(relations, `Remake of ${wiki.spinOffOf}`);
+      if (wiki.follows) addUnique(relations, `Sequel to ${wiki.follows}`);
+      if (wiki.followedBy) addUnique(relations, `Followed by ${wiki.followedBy}`);
+      if (wiki.basedOn && !wiki.spinOffOf && !sourceMaterial.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sourceMaterial.unshift(wiki.basedOn);
-      } else if (wiki.follows && !franchise) {
-        franchise = `Sequel to ${wiki.follows}`;
-      } else if (wiki.followedBy && !franchise) {
-        franchise = `Prequel to ${wiki.followedBy}`;
       }
 
       if ((!specialCut || !specialCut.runtime) && wiki.specialCut) {
         specialCut = wiki.specialCut;
       }
+    }
+
+    if (spinOffOf) addUnique(relations, `Spin-off of ${spinOffOf}`);
+
+    // Prefer the real Wikipedia article over a search page
+    let wikiUrl = wiki?.wikiUrl;
+    if (!wikiUrl || /Special:Search/i.test(wikiUrl) || wikiUrl === "https://en.wikipedia.org/") {
+      wikiUrl = (await findWikipediaUrl(movieTitle, movieYear, "movie")) || wikiUrl;
     }
 
     const value = {
@@ -1039,13 +1158,13 @@ async function getMovieInfo(rawId, creds) {
       theatrical,
       digital,
       specialCut,
-      sourceMaterial: [...new Set(sourceMaterial)].slice(0, 2),
+      sourceMaterial: [...new Set(sourceMaterial)].slice(0, 3),
       franchise,
-      spinOffOf,
-      wikiUrl: wiki.wikiUrl
+      relations: relations.slice(0, 3),
+      wikiUrl
     };
 
-    cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
+    cacheSet(cacheKey, value);
     return value;
   })();
 
@@ -1061,27 +1180,8 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
   if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
 
   const promise = (async () => {
-    // Fast-path intercept for Lanterns (unreleased on TMDB)
-    const rawClean = String(seriesRawId).replace("tmdb:", "");
-    if (rawClean === "219847" || rawClean === "tt26540674") {
-      const known = KNOWN_SERIES_CONTINUITY["219847"];
-      return {
-        type: "series",
-        tvId: "219847",
-        season: 1,
-        episode: 1,
-        title: "Lanterns (In Production)",
-        airDate: known.expectedAir,
-        runtime: null,
-        specialCut: null,
-        sourceMaterial: [known.basedOn],
-        franchise: known.franchise,
-        spinOffOf: null,
-        revivalOf: null,
-        wikiUrl: known.wikiUrl
-      };
-    }
-
+    // (Lanterns is handled by the normal TMDB flow now; KNOWN_SERIES_CONTINUITY
+    // still supplies its source/franchise and an "expected" fallback date.)
     const { tvId, imdbId, showData } = await resolveTvShow(seriesRawId, creds);
 
     let epData = null;
@@ -1162,6 +1262,14 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     if (knownMatch?.basedOn) sources.push(knownMatch.basedOn);
     if (knownMatch?.spinOffOf) spinOffOf = knownMatch.spinOffOf;
 
+    // 1b. Curated per-season / per-episode sources (episode first, then season)
+    if (tvId) {
+      const seasonKnown = KNOWN_EPISODE_SOURCES[`${tvId}:${season}`];
+      const episodeKnown = KNOWN_EPISODE_SOURCES[`${tvId}:${season}:${episode}`];
+      if (seasonKnown) sources.unshift(seasonKnown);
+      if (episodeKnown) sources.unshift(episodeKnown);
+    }
+
     // 2. Scrape Wikidata directly for episode adaptations
     const epWikiData = await fetchWikidataEpisodeAdaptation(imdbId, season, episode, epImdbId);
     if (epWikiData?.adaptedSource && !sources.includes(epWikiData.adaptedSource)) {
@@ -1214,6 +1322,8 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     let franchise = knownMatch?.franchise || null;
     let revivalOf = knownMatch?.revivalOf || null;
+    const aiRelations = [];
+    const wikiRelations = [];
     const showTitle = showData?.name || showData?.original_name || "";
     const showYear = (epData?.air_date || showData?.first_air_date || "").split("-")[0];
 
@@ -1224,6 +1334,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (aiShowData) {
         if (!spinOffOf && aiShowData.spinOffOf) spinOffOf = aiShowData.spinOffOf;
         if (!franchise && aiShowData.franchise) franchise = aiShowData.franchise;
+        addUnique(aiRelations, relationLine(aiShowData.relationType, aiShowData.relatedTitle));
         if (aiShowData.basedOn && !sources.some(s => s.toLowerCase().includes(aiShowData.basedOn.toLowerCase()))) {
           sources.push(aiShowData.basedOn);
         }
@@ -1271,11 +1382,9 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       if (!spinOffOf && wiki.spinOffOf) spinOffOf = wiki.spinOffOf;
       if (wiki.basedOn && !sources.some(s => s.toLowerCase().includes(wiki.basedOn.toLowerCase()))) {
         sources.unshift(wiki.basedOn);
-      } else if (wiki.follows && !franchise && !revivalOf) {
-        franchise = `Continuation of ${wiki.follows}`;
-      } else if (wiki.followedBy && !franchise) {
-        franchise = `Prequel to ${wiki.followedBy}`;
       }
+      if (wiki.follows && !revivalOf) addUnique(wikiRelations, `Continuation of ${wiki.follows}`);
+      if (wiki.followedBy) addUnique(wikiRelations, `Followed by ${wiki.followedBy}`);
     }
 
     // Heuristic fallbacks for titles containing specific keywords
@@ -1294,7 +1403,18 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
 
     const episodeTitle = epData?.name || (showData?.name ? `${showData.name} (In Production)` : `S${season}E${episode}`);
-    const finalWikiUrl = episodeWikiUrl || knownMatch?.wikiUrl || wiki?.wikiUrl || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`;
+    let finalWikiUrl = episodeWikiUrl || knownMatch?.wikiUrl || wiki?.wikiUrl;
+    if (!finalWikiUrl || /Special:Search/i.test(finalWikiUrl) || finalWikiUrl === "https://en.wikipedia.org/") {
+      finalWikiUrl = (await findWikipediaUrl(showTitle, showYear, "series"))
+        || finalWikiUrl
+        || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`;
+    }
+
+    const relations = [];
+    if (revivalOf) addUnique(relations, revivalOf);
+    if (spinOffOf) addUnique(relations, `Spin-off of ${spinOffOf}`);
+    aiRelations.forEach(r => addUnique(relations, r));
+    wikiRelations.forEach(r => addUnique(relations, r));
 
     const value = {
       type: "series",
@@ -1305,14 +1425,13 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       airDate: airDate || (knownMatch?.expectedAir || "Not announced"),
       runtime,
       specialCut,
-      sourceMaterial: [...new Set(sources)].slice(0, 2),
+      sourceMaterial: [...new Set(sources)].slice(0, 3),
       franchise,
-      spinOffOf,
-      revivalOf,
+      relations: relations.slice(0, 3),
       wikiUrl: finalWikiUrl
     };
 
-    cache.set(cacheKey, { value, expires: Date.now() + CACHE_TTL_MS });
+    cacheSet(cacheKey, value);
     return value;
   })();
 
@@ -1321,21 +1440,14 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
   finally { activeRequests.delete(cacheKey); }
 }
 
-function streamMovie(info) {
-  const runtimeTheatricalSuffix = info.theatricalRuntime ? ` [Running Time: ${info.theatricalRuntime}]` : "";
+function fmtRelease(rel) {
+  if (!rel) return "Not announced";
+  const d = parseDate(rel.release_date);
+  return d ? `${d} (${rel.region})` : "Not announced";
+}
 
-  const theatrical = info.theatrical
-    ? `${parseDate(info.theatrical.release_date)} (${info.theatrical.region})`
-    : "Not announced";
-
-  const digital = info.digital
-    ? `${parseDate(info.digital.release_date)} (${info.digital.region})`
-    : "Not announced";
-
-  const lines = [
-    `🎬 Theatrical${runtimeTheatricalSuffix}: ${theatrical}`,
-    `💻 Digital: ${digital}`
-  ];
+function buildExtraLines(info) {
+  const lines = [];
 
   if (info.specialCut) {
     const name = info.specialCut.editionName || "Extended Cut";
@@ -1343,72 +1455,47 @@ function streamMovie(info) {
     lines.push(`✂️ ${name}${runtime}`);
   }
 
-  if (info.spinOffOf) {
-    lines.push(`🔀 Spin-off of: ${info.spinOffOf}`);
-  }
-
-  if (info.revivalOf) {
-    lines.push(`🔄 ${info.revivalOf}`);
-  }
+  for (const r of info.relations || []) lines.push(`🔄 ${r}`);
 
   if (info.sourceMaterial && info.sourceMaterial.length > 0) {
     lines.push(`📖 Based on: ${info.sourceMaterial.join(", ")}`);
   }
 
-  if (info.franchise) {
-    lines.push(`🔗 Part of: ${info.franchise}`);
-  }
+  if (info.franchise) lines.push(`🔗 Part of: ${info.franchise}`);
 
+  return lines;
+}
+
+function buildStream(lines, url) {
+  const text = lines.join("\n");
   return [
     {
-      name: `Release Info`,
-      title: lines.join("\n"),
-      description: lines.join(" | "),
-      externalUrl: info.wikiUrl,
+      name: "Release Info",
+      title: text,
+      description: text,
+      externalUrl: url || "https://en.wikipedia.org/",
       behaviorHints: { notWebReady: true }
     }
   ];
 }
 
-function streamEpisode(info) {
-  const runtimeSuffix = info.runtime ? ` [Running Time: ${info.runtime}]` : "";
-  const airDate = info.airDate ? info.airDate : "Not announced";
-
+function streamMovie(info) {
+  const rt = info.theatricalRuntime ? ` [Running Time: ${info.theatricalRuntime}]` : "";
   const lines = [
-    `📺 Air Date${runtimeSuffix}: ${airDate}`
+    `🎬 Theatrical${rt}: ${fmtRelease(info.theatrical)}`,
+    `💻 Digital: ${fmtRelease(info.digital)}`,
+    ...buildExtraLines(info)
   ];
+  return buildStream(lines, info.wikiUrl);
+}
 
-  if (info.specialCut) {
-    const name = info.specialCut.editionName || "Extended Cut";
-    const runtime = info.specialCut.runtime ? ` [Running Time: ${info.specialCut.runtime}]` : "";
-    lines.push(`✂️ ${name}${runtime}`);
-  }
-
-  if (info.spinOffOf) {
-    lines.push(`🔀 Spin-off of: ${info.spinOffOf}`);
-  }
-
-  if (info.revivalOf) {
-    lines.push(`🔄 ${info.revivalOf}`);
-  }
-
-  if (info.sourceMaterial && info.sourceMaterial.length > 0) {
-    lines.push(`📖 Based on: ${info.sourceMaterial.join(", ")}`);
-  }
-
-  if (info.franchise) {
-    lines.push(`🔗 Part of: ${info.franchise}`);
-  }
-
-  return [
-    {
-      name: `Release Info`,
-      title: lines.join("\n"),
-      description: lines.join(" | "),
-      externalUrl: info.wikiUrl,
-      behaviorHints: { notWebReady: true }
-    }
+function streamEpisode(info) {
+  const rt = info.runtime ? ` [Running Time: ${info.runtime}]` : "";
+  const lines = [
+    `📺 Air Date${rt}: ${info.airDate || "Not announced"}`,
+    ...buildExtraLines(info)
   ];
+  return buildStream(lines, info.wikiUrl);
 }
 
 // ----------------- Live Key Validation Endpoint -----------------
@@ -1648,7 +1735,7 @@ app.get("/", (_req, res) => {
 
 app.get("/health", (_req, res) => res.json({
   status: "ok",
-  version: "6.4.0",
+  version: "6.5.0",
   geminiCircuitBreakerActive: Date.now() < geminiDisabledUntil,
   defaultRegion: DEFAULT_REGION
 }));
@@ -1656,7 +1743,7 @@ app.get("/health", (_req, res) => res.json({
 function getManifestJson() {
   return {
     id: "com.nuvio.release-info.stream",
-    version: "6.4.0",
+    version: "6.5.0",
     name: "Release Info",
     description: "Shows release dates, runtimes (theatrical & extended cuts), episodic adaptations (books/novellas/plays/mythology/real events), spin-offs, and franchise continuity for Movies & TV series in Nuvio/Stremio.",
     logo: "https://www.themoviedb.org/assets/2/v4/logos/v2/blue_square_2-d537fb228cf3ded904ef09b136fe3fec72548ebc1fea3fbbd1ad9e36364db38b.svg",
