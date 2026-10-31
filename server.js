@@ -16,9 +16,55 @@ app.use(express.json());
 const cache = new Map();
 const activeRequests = new Map();
 
-function cacheSet(key, value) {
+const crypto = require("crypto");
+const path = require("path");
+const CACHE_FILE = process.env.CACHE_FILE || path.join(__dirname, "release-info-cache.json");
+const STALE_MAX_MS = 7 * 24 * 3600 * 1000; // expired entries are still served instantly for up to 7 days while refreshing
+
+// Keys contain API tokens, so only a hash is ever stored (and written to disk)
+function hashKey(k) {
+  return crypto.createHash("sha1").update(String(k)).digest("hex");
+}
+
+try {
+  const saved = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+  for (const [k, v] of saved) cache.set(k, v);
+} catch {
+  // no saved cache yet
+}
+
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      fs.writeFile(CACHE_FILE, JSON.stringify([...cache.entries()].slice(-2000)), () => {});
+    } catch {
+      // disk not writable: memory cache still works
+    }
+  }, 5000);
+  if (saveTimer.unref) saveTimer.unref();
+}
+
+function cacheSet(key, value, ttl = CACHE_TTL_MS) {
   if (cache.size > 2000) cache.delete(cache.keys().next().value);
-  cache.set(key, { value, expires: Date.now() + CACHE_TTL_MS });
+  cache.set(key, { value, expires: Date.now() + ttl });
+  scheduleSave();
+}
+
+// Remembers show-level lookups (Gemini, Wikidata) so every episode of a show reuses them
+const memoStore = new Map();
+function memo(key, fn, ttl = CACHE_TTL_MS * 4) {
+  const hit = memoStore.get(key);
+  if (hit && hit.expires > Date.now()) return hit.p;
+  const p = Promise.resolve().then(fn).then(
+    v => { if (v == null) memoStore.delete(key); return v; },
+    err => { memoStore.delete(key); throw err; }
+  );
+  if (memoStore.size > 3000) memoStore.delete(memoStore.keys().next().value);
+  memoStore.set(key, { p, expires: Date.now() + ttl });
+  return p;
 }
 
 // Gemini Circuit Breaker timestamp (disables calls temporarily on 429 rate limit)
@@ -448,6 +494,42 @@ async function fetchWikipediaSource(wikiUrl) {
   }
   wikiSourceCache.set(title, result);
   return result;
+}
+
+function sourceKey(str) {
+  const q = String(str).match(/"([^"]+)"/);
+  const core = q
+    ? q[1]
+    : String(str).replace(/^[A-Za-z' -]{2,25}:\s*/, "").replace(/\s+by\s+.*$/i, "").replace(/\(.*?\)/g, "");
+  return normTitle(core);
+}
+
+// Same work written two ways ("Green Lantern" / "Comic: "Green Lantern" by ...") keeps one, the most informative
+function dedupeSources(list) {
+  const score = x => (/"/.test(x) ? 2 : 0) + (/\bby\b/i.test(x) ? 2 : 0) + Math.min(String(x).length, 200) / 200;
+  const out = [];
+  for (const item of list) {
+    if (!item) continue;
+    const k = sourceKey(item);
+    const idx = out.findIndex(o => {
+      const ok = sourceKey(o);
+      if (!ok || !k) return false;
+      return ok === k || (Math.min(ok.length, k.length) >= 5 && (ok.includes(k) || k.includes(ok)));
+    });
+    if (idx === -1) out.push(item);
+    else if (score(item) > score(out[idx])) out[idx] = item;
+  }
+  return out;
+}
+
+function dedupeRelations(list) {
+  const seen = new Set();
+  return list.filter(r => {
+    const key = normTitle(String(r).replace(/^[A-Za-z' -]+?\s(?:of|to|on|by|from)\s/i, "").replace(/\(.*?\)/g, ""));
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // Put a relation first, replacing any weaker line about the same work (e.g. Wikidata's generic "Remake of")
@@ -1220,12 +1302,15 @@ async function resolveTvShow(rawId, creds) {
 }
 
 async function getMovieInfo(rawId, creds) {
-  const cacheKey = `movie:${creds.tmdbToken || creds.tmdbKey}:${rawId}`;
+  const cacheKey = hashKey(`movie:v2:${creds.tmdbToken || creds.tmdbKey}:${rawId}`);
   const cached = cache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.value;
-  if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
+  // Expired but recent: answer instantly from the old copy and refresh in the background
+  const staleValue = cached && Date.now() - cached.expires < STALE_MAX_MS ? cached.value : null;
+  if (activeRequests.has(cacheKey)) return staleValue || activeRequests.get(cacheKey);
 
   const promise = (async () => {
+    let degraded = false;
     const { movie, imdbId } = await resolveMovie(rawId, creds);
     const countries = movie.release_dates?.results || [];
 
@@ -1278,6 +1363,7 @@ async function getMovieInfo(rawId, creds) {
     // 1. Gemini AI (including alternate edition detection)
     if (creds.geminiKey) {
       const aiData = await aiP;
+      if (!aiData) degraded = true;
       if (aiData) {
         if (!spinOffOf && aiData.spinOffOf) spinOffOf = aiData.spinOffOf;
         if (!franchise && aiData.franchise) franchise = aiData.franchise;
@@ -1340,28 +1426,35 @@ async function getMovieInfo(rawId, creds) {
       theatrical,
       digital,
       specialCut,
-      sourceMaterial: [...new Set(sourceMaterial)].slice(0, 3),
+      sourceMaterial: dedupeSources(sourceMaterial).slice(0, 3),
       franchise,
-      relations: relations.slice(0, 3),
+      relations: dedupeRelations(relations).slice(0, 3),
       wikiUrl
     };
 
-    cacheSet(cacheKey, value);
+    cacheSet(cacheKey, value, degraded ? 10 * 60 * 1000 : CACHE_TTL_MS);
     return value;
   })();
 
   activeRequests.set(cacheKey, promise);
+  if (staleValue) {
+    promise.catch(() => {}).finally(() => activeRequests.delete(cacheKey));
+    return staleValue;
+  }
   try { return await promise; }
   finally { activeRequests.delete(cacheKey); }
 }
 
 async function getEpisodeInfo(seriesRawId, season, episode, creds) {
-  const cacheKey = `tv:${creds.tmdbToken || creds.tmdbKey}:${creds.tvdbKey}:${seriesRawId}:${season}:${episode}`;
+  const cacheKey = hashKey(`tv:v2:${creds.tmdbToken || creds.tmdbKey}:${creds.tvdbKey}:${seriesRawId}:${season}:${episode}`);
   const cached = cache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.value;
-  if (activeRequests.has(cacheKey)) return activeRequests.get(cacheKey);
+  // Expired but recent: answer instantly from the old copy and refresh in the background
+  const staleValue = cached && Date.now() - cached.expires < STALE_MAX_MS ? cached.value : null;
+  if (activeRequests.has(cacheKey)) return staleValue || activeRequests.get(cacheKey);
 
   const promise = (async () => {
+    let degraded = false;
     // (Lanterns is handled by the normal TMDB flow now; KNOWN_SERIES_CONTINUITY
     // still supplies its source/franchise and an "expected" fallback date.)
     const { tvId, imdbId, showData } = await resolveTvShow(seriesRawId, creds);
@@ -1371,9 +1464,9 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     const earlyYear = (showData?.first_air_date || "").split("-")[0];
     const earlyStartYear = parseInt(earlyYear, 10) || null;
     const aiShowP = creds.geminiKey
-      ? analyzeMediaWithAI(earlyTitle, earlyYear, showData?.overview, "series", creds.geminiKey).catch(() => null)
+      ? memo(`aiShow:${tvId || imdbId || earlyTitle}`, () => analyzeMediaWithAI(earlyTitle, earlyYear, showData?.overview, "series", creds.geminiKey)).catch(() => null)
       : Promise.resolve(null);
-    const wikidataP = fetchWikidataDetails(imdbId, earlyTitle, earlyStartYear).catch(() => null);
+    const wikidataP = memo(`wdShow:${tvId || imdbId || earlyTitle}`, () => fetchWikidataDetails(imdbId, earlyTitle, earlyStartYear)).catch(() => null);
     const wikiSearchP = findWikipediaUrl(earlyTitle, earlyYear, "series").catch(() => null);
 
     const [epData, seasonData] = await Promise.all([
@@ -1518,6 +1611,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     if (creds.geminiKey) {
       // Series & Spin-off inspection
       const aiShowData = await aiShowP;
+      if (!aiShowData) degraded = true;
       if (aiShowData) {
         if (!spinOffOf && aiShowData.spinOffOf) spinOffOf = aiShowData.spinOffOf;
         if (!franchise && aiShowData.franchise) franchise = aiShowData.franchise;
@@ -1619,17 +1713,21 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       airDate: airDate || (knownMatch?.expectedAir || "Not announced"),
       runtime,
       specialCut,
-      sourceMaterial: [...new Set(sources)].slice(0, 3),
+      sourceMaterial: dedupeSources(sources).slice(0, 3),
       franchise,
-      relations: relations.slice(0, 3),
+      relations: dedupeRelations(relations).slice(0, 3),
       wikiUrl: finalWikiUrl
     };
 
-    cacheSet(cacheKey, value);
+    cacheSet(cacheKey, value, degraded ? 10 * 60 * 1000 : CACHE_TTL_MS);
     return value;
   })();
 
   activeRequests.set(cacheKey, promise);
+  if (staleValue) {
+    promise.catch(() => {}).finally(() => activeRequests.delete(cacheKey));
+    return staleValue;
+  }
   try { return await promise; }
   finally { activeRequests.delete(cacheKey); }
 }
