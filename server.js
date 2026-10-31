@@ -35,6 +35,11 @@ const KNOWN_IMDB_TO_TMDB = {
 };
 
 // Curated dictionary for legendary movie alternate/extended cuts with running times
+// Same idea, keyed by IMDb id (use when you don't know the TMDB id)
+const KNOWN_MOVIE_CUTS_IMDB = {
+  "tt0237534": { editionName: "Director's Cut", runtime: "2h 30m" } // Brotherhood of the Wolf (Wikipedia lists 150-152 min)
+};
+
 const KNOWN_MOVIE_CUTS = {
   "120":    { editionName: "Extended Edition", runtime: "3h 48m" }, // LOTR: Fellowship
   "121":    { editionName: "Extended Edition", runtime: "3h 55m" }, // LOTR: Two Towers
@@ -356,6 +361,67 @@ function parseWikitextBasedOn(wt) {
   return `${label || "Based on"}: "${title}"${author ? ` by ${author}` : ""}`;
 }
 
+// Reads the opening sentences of the Wikipedia article and finds relations such as
+// "an unofficial remake of the 2010 South Korean film I Saw the Devil" or "inspired by the film ...".
+function parseLeadRelation(wt) {
+  let t = String(wt || "");
+  // Drop the infobox so only the lead paragraph remains
+  const infoStart = t.search(/\{\{\s*Infobox/i);
+  if (infoStart !== -1) {
+    const end = t.indexOf("\n}}", infoStart);
+    if (end !== -1) t = t.slice(end + 3);
+  }
+  t = t
+    .replace(/<ref[^>]*\/>/g, "")
+    .replace(/<ref[\s\S]*?<\/ref>/g, "")
+    .replace(/\[\[(?:[^\]|]*\|)?([^\]]+)\]\]/g, "$1")
+    .replace(/'''/g, "")
+    .replace(/''/g, '"');
+  for (let i = 0; i < 3; i++) t = t.replace(/\{\{[^{}]*\}\}/g, " ");
+  t = t.replace(/\s+/g, " ").slice(0, 2500);
+
+  const re = /\b(unofficial remake|official remake|remake|reboot|reimagining|loosely based|loosely inspired|inspired|adaptation|based|spin-?off|prequel|sequel|continuation)\b(?:\s+(?:of|on|by|to|from))?\s+(?:the\s+)?(?:(\d{4})\s+)?(?:[A-Za-z\-]+\s+){0,4}?(?:film|movie|television series|TV series|series|show|sitcom|miniseries)\s+"([^"]{2,80})"/i;
+  const m = t.match(re);
+  if (!m) return null;
+
+  const labels = {
+    "unofficial remake": "Unofficial remake of", "official remake": "Remake of", "remake": "Remake of",
+    "reboot": "Reboot of", "reimagining": "Reimagining of", "loosely based": "Loosely based on",
+    "loosely inspired": "Inspired by", "inspired": "Inspired by", "adaptation": "Based on",
+    "based": "Based on", "spinoff": "Spin-off of", "spin-off": "Spin-off of",
+    "prequel": "Prequel to", "sequel": "Sequel to", "continuation": "Continuation of"
+  };
+  const label = labels[m[1].toLowerCase()];
+  if (!label) return null;
+  const title = m[3].trim();
+  return { title, line: `${label} ${title}${m[2] ? ` (${m[2]})` : ""}` };
+}
+
+// Reads infobox "runtime" such as "142 minutes<br>152 minutes (Director's Cut)" and returns the alternate cut
+function parseInfoboxCut(wt) {
+  const m = String(wt || "").match(/\|\s*runtime\s*=\s*([^\n]*(?:\n(?!\s*\|)[^\n]*)*)/i);
+  if (!m) return null;
+  const raw = m[1]
+    .replace(/<ref[\s\S]*?<\/ref>/g, "")
+    .replace(/<ref[^>]*\/>/g, "")
+    .replace(/\[\[(?:[^\]|]*\|)?([^\]]+)\]\]/g, "$1")
+    .replace(/\{\{\s*(?:plainlist|unbulleted list|ubl|flatlist)\s*\|/gi, "")
+    .replace(/\{\{|\}\}/g, "")
+    .replace(/<br\s*\/?>|\n|\*|\|/g, "\n");
+  const edition = /director|extended|unrated|special edition|ultimate|alternate|uncut|final cut|redux|international|theatrical/i;
+  for (const line of raw.split("\n").map(x => x.trim()).filter(Boolean)) {
+    const mm = line.match(/(\d{2,3})\s*(?:min|minutes)/i);
+    if (!mm || !edition.test(line) || /^[^(]*theatrical/i.test(line) && !/director|extended|unrated|special|ultimate|alternate|uncut|redux/i.test(line)) continue;
+    const paren = line.match(/\(([^)]*)\)/);
+    let name = (paren ? paren[1] : line.replace(/\d{2,3}\s*(?:min|minutes)/i, "")).replace(/[()]/g, "").trim();
+    if (!name || /^theatrical/i.test(name)) continue;
+    name = name.charAt(0).toUpperCase() + name.slice(1);
+    return { editionName: name, runtime: formatMinutes(parseInt(mm[1], 10)) };
+  }
+  return null;
+}
+
+// Returns { source, relation, relTitle } read from the title's Wikipedia article (cached)
 async function fetchWikipediaSource(wikiUrl) {
   const m = String(wikiUrl || "").match(/^https:\/\/en\.wikipedia\.org\/wiki\/([^?#]+)/);
   if (!m || /^Special:/i.test(m[1])) return null;
@@ -368,13 +434,32 @@ async function fetchWikipediaSource(wikiUrl) {
     const r = await fetchT(u, { headers: WIKI_UA }, 8000);
     if (r.ok) {
       const j = await r.json();
-      result = parseWikitextBasedOn(j?.parse?.wikitext?.["*"] || "");
+      const wt = j?.parse?.wikitext?.["*"] || "";
+      const rel = parseLeadRelation(wt);
+      result = {
+        source: parseWikitextBasedOn(wt),
+        cut: parseInfoboxCut(wt),
+        relation: rel ? rel.line : null,
+        relTitle: rel ? rel.title : null
+      };
     }
   } catch {
-    // ignore, no source found
+    // ignore, nothing found
   }
   wikiSourceCache.set(title, result);
   return result;
+}
+
+// Put a relation first, replacing any weaker line about the same work (e.g. Wikidata's generic "Remake of")
+function addRelationPreferred(list, line, relTitle) {
+  if (!line) return;
+  if (relTitle) {
+    const key = relTitle.toLowerCase();
+    for (let i = list.length - 1; i >= 0; i--) {
+      if (list[i].toLowerCase().includes(key)) list.splice(i, 1);
+    }
+  }
+  list.unshift(line);
 }
 
 function addUnique(list, text) {
@@ -1164,8 +1249,8 @@ async function getMovieInfo(rawId, creds) {
       if (specialCut) break;
     }
 
-    if ((!specialCut || !specialCut.runtime) && KNOWN_MOVIE_CUTS[String(movie.id)]) {
-      specialCut = KNOWN_MOVIE_CUTS[String(movie.id)];
+    if ((!specialCut || !specialCut.runtime) && (KNOWN_MOVIE_CUTS[String(movie.id)] || KNOWN_MOVIE_CUTS_IMDB[imdbId])) {
+      specialCut = KNOWN_MOVIE_CUTS[String(movie.id)] || KNOWN_MOVIE_CUTS_IMDB[imdbId];
     }
 
     const movieKeywords = movie.keywords?.keywords || [];
@@ -1183,9 +1268,16 @@ async function getMovieInfo(rawId, creds) {
     const movieTitle = movie.title || movie.original_title || "";
     const movieYear = (movie.release_date || "").split("-")[0];
 
-    // 1. Try Gemini AI (including alternate edition detection)
+    // Start every independent lookup at the same time (Gemini, Wikidata, Wikipedia search)
+    const aiP = creds.geminiKey
+      ? analyzeMediaWithAI(movieTitle, movieYear, movie.overview, "movie", creds.geminiKey).catch(() => null)
+      : Promise.resolve(null);
+    const wikidataP = fetchWikidataMovieDetails(imdbId, movieTitle, movie.runtime).catch(() => null);
+    const wikiSearchP = findWikipediaUrl(movieTitle, movieYear, "movie").catch(() => null);
+
+    // 1. Gemini AI (including alternate edition detection)
     if (creds.geminiKey) {
-      const aiData = await analyzeMediaWithAI(movieTitle, movieYear, movie.overview, "movie", creds.geminiKey);
+      const aiData = await aiP;
       if (aiData) {
         if (!spinOffOf && aiData.spinOffOf) spinOffOf = aiData.spinOffOf;
         if (!franchise && aiData.franchise) franchise = aiData.franchise;
@@ -1206,7 +1298,7 @@ async function getMovieInfo(rawId, creds) {
     }
 
     // 2. Query Wikidata (Primary or fallback)
-    const wiki = await fetchWikidataMovieDetails(imdbId, movieTitle, movie.runtime);
+    const wiki = await wikidataP;
     if (wiki) {
       if (!franchise && wiki.franchise) franchise = wiki.franchise;
       // For films, "based on another film" in Wikidata means a remake
@@ -1226,13 +1318,17 @@ async function getMovieInfo(rawId, creds) {
     // Prefer the real Wikipedia article over a search page
     let wikiUrl = wiki?.wikiUrl;
     if (!wikiUrl || /Special:Search/i.test(wikiUrl) || wikiUrl === "https://en.wikipedia.org/") {
-      wikiUrl = (await findWikipediaUrl(movieTitle, movieYear, "movie")) || wikiUrl;
+      wikiUrl = (await wikiSearchP) || wikiUrl;
     }
 
-    // Wikipedia infobox fallback for the source work (fixes new releases)
-    if (!sourceMaterial.some(s => /"/.test(s))) {
-      const wikiSrc = await fetchWikipediaSource(wikiUrl);
-      if (wikiSrc) sourceMaterial.unshift(wikiSrc);
+    // Wikipedia article text: relation (remake / inspired by / sequel...) and source work
+    const wikiExtra = await fetchWikipediaSource(wikiUrl);
+    if (wikiExtra) {
+      if ((!specialCut || !specialCut.runtime) && wikiExtra.cut) specialCut = wikiExtra.cut;
+      addRelationPreferred(relations, wikiExtra.relation, wikiExtra.relTitle);
+      const src = wikiExtra.source;
+      const duplicatesRelation = src && wikiExtra.relTitle && src.toLowerCase().includes(wikiExtra.relTitle.toLowerCase());
+      if (src && !duplicatesRelation && !sourceMaterial.some(x => /"/.test(x))) sourceMaterial.unshift(src);
     }
 
     const value = {
@@ -1270,23 +1366,28 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     // still supplies its source/franchise and an "expected" fallback date.)
     const { tvId, imdbId, showData } = await resolveTvShow(seriesRawId, creds);
 
-    let epData = null;
-    if (tvId) {
-      try {
-        epData = await tmdbGet(`/tv/${tvId}/season/${season}/episode/${episode}?append_to_response=credits,external_ids`, creds);
-      } catch {
-        // Episode not indexed yet
-      }
-    }
+    // Start show-level lookups immediately, while the episode and season load in parallel
+    const earlyTitle = showData?.name || showData?.original_name || "";
+    const earlyYear = (showData?.first_air_date || "").split("-")[0];
+    const earlyStartYear = parseInt(earlyYear, 10) || null;
+    const aiShowP = creds.geminiKey
+      ? analyzeMediaWithAI(earlyTitle, earlyYear, showData?.overview, "series", creds.geminiKey).catch(() => null)
+      : Promise.resolve(null);
+    const wikidataP = fetchWikidataDetails(imdbId, earlyTitle, earlyStartYear).catch(() => null);
+    const wikiSearchP = findWikipediaUrl(earlyTitle, earlyYear, "series").catch(() => null);
 
-    let seasonData = null;
-    if (tvId) {
-      try {
-        seasonData = await tmdbGet(`/tv/${tvId}/season/${season}?append_to_response=credits`, creds);
-      } catch {
-        // Season not indexed yet
-      }
-    }
+    const [epData, seasonData] = await Promise.all([
+      tvId
+        ? tmdbGet(`/tv/${tvId}/season/${season}/episode/${episode}?append_to_response=credits,external_ids`, creds).catch(() => null)
+        : null,
+      tvId
+        ? tmdbGet(`/tv/${tvId}/season/${season}?append_to_response=credits`, creds).catch(() => null)
+        : null
+    ]);
+
+    const aiEpP = creds.geminiKey
+      ? analyzeEpisodeWithAI(earlyTitle, season, episode, epData?.name, epData?.overview, seasonData?.overview, creds.geminiKey).catch(() => null)
+      : Promise.resolve(null);
 
     const airDate = parseDate(epData?.air_date || showData?.first_air_date);
     const runtime = formatMinutes(epData?.runtime || (showData?.episode_run_time || [])[0]);
@@ -1416,7 +1517,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     // 6. Gemini AI: Series, Per-Season & Per-Episode Deep Inspection
     if (creds.geminiKey) {
       // Series & Spin-off inspection
-      const aiShowData = await analyzeMediaWithAI(showTitle, showYear, showData?.overview, "series", creds.geminiKey);
+      const aiShowData = await aiShowP;
       if (aiShowData) {
         if (!spinOffOf && aiShowData.spinOffOf) spinOffOf = aiShowData.spinOffOf;
         if (!franchise && aiShowData.franchise) franchise = aiShowData.franchise;
@@ -1430,15 +1531,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
       }
 
       // Per-Season & Per-Episode Granular Inspection
-      const aiEpData = await analyzeEpisodeWithAI(
-        showTitle,
-        season,
-        episode,
-        epData?.name,
-        epData?.overview,
-        seasonData?.overview,
-        creds.geminiKey
-      );
+      const aiEpData = await aiEpP;
 
       if (aiEpData) {
         if (aiEpData.adaptedSource && !sources.some(s => s.toLowerCase().includes(aiEpData.adaptedSource.toLowerCase()))) {
@@ -1458,7 +1551,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
 
     // 7. Wikidata Details (Primary or fallback)
     const showStartYear = parseInt((showData?.first_air_date || "").split("-")[0], 10) || null;
-    const wiki = await fetchWikidataDetails(imdbId, showTitle, showStartYear);
+    const wiki = await wikidataP;
     if (wiki) {
       if (!franchise && wiki.franchise) {
         franchise = wiki.franchise.toLowerCase().includes("franchise") || wiki.franchise.toLowerCase().includes("universe")
@@ -1492,15 +1585,19 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     const episodeTitle = epData?.name || (showData?.name ? `${showData.name} (In Production)` : `S${season}E${episode}`);
     let finalWikiUrl = episodeWikiUrl || knownMatch?.wikiUrl || wiki?.wikiUrl;
     if (!finalWikiUrl || /Special:Search/i.test(finalWikiUrl) || finalWikiUrl === "https://en.wikipedia.org/") {
-      finalWikiUrl = (await findWikipediaUrl(showTitle, showYear, "series"))
+      finalWikiUrl = (await wikiSearchP)
         || finalWikiUrl
         || `https://en.wikipedia.org/wiki/Special:Search?search=${encodeURIComponent(showTitle)}`;
     }
 
-    // Wikipedia infobox fallback for the source work
-    if (!sources.some(s => /"/.test(s))) {
-      const wikiSrc = await fetchWikipediaSource(finalWikiUrl);
-      if (wikiSrc) sources.unshift(wikiSrc);
+    // Wikipedia article text: relation and source work
+    const wikiExtra = await fetchWikipediaSource(finalWikiUrl);
+    let wikiRelationLine = null;
+    if (wikiExtra) {
+      wikiRelationLine = wikiExtra.relation;
+      const src = wikiExtra.source;
+      const duplicatesRelation = src && wikiExtra.relTitle && src.toLowerCase().includes(wikiExtra.relTitle.toLowerCase());
+      if (src && !duplicatesRelation && !sources.some(x => /"/.test(x))) sources.unshift(src);
     }
 
     const relations = [];
@@ -1511,6 +1608,7 @@ async function getEpisodeInfo(seriesRawId, season, episode, creds) {
     }
     aiRelations.forEach(r => addUnique(relations, r));
     wikiRelations.forEach(r => addUnique(relations, r));
+    if (wikiExtra) addRelationPreferred(relations, wikiRelationLine, wikiExtra.relTitle);
 
     const value = {
       type: "series",
